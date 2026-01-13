@@ -12,6 +12,7 @@ from pyomo.common.dependencies import numpy as np, numpy_available
 
 import pyomo.common.unittest as unittest
 from pyomo.contrib.doe.utils import (
+    _SMALL_TOLERANCE_SINGULARITY,
     check_FIM,
     compute_FIM_metrics,
     get_FIM_metrics,
@@ -129,10 +130,50 @@ class TestUtilsFIM(unittest.TestCase):
             np.allclose(E_vecs, E_vecs_expected),
             msg=f"Expected eigenvectors to be identity, got \n{E_vecs}",
         )
-        self.assertAlmostEqual(D_opt, D_opt_expected)
-        self.assertAlmostEqual(A_opt, A_opt_expected)
-        self.assertAlmostEqual(E_opt, E_opt_expected)
-        self.assertAlmostEqual(ME_opt, ME_opt_expected)
+        self.assertEqual(D_opt, D_opt_expected)
+        self.assertEqual(A_opt, A_opt_expected)
+        self.assertEqual(E_opt, E_opt_expected)
+        self.assertEqual(ME_opt, ME_opt_expected)
+
+    def test_compute_FIM_metrics_warning(self):
+        # For singular FIM, verify that appropriate warnings are logged
+        with self.assertLogs("pyomo.contrib.doe.utils", level="WARNING") as cm:
+            FIM = np.zeros((2, 2))
+            # Call the function to trigger warnings
+            compute_FIM_metrics(FIM)
+            # cm.output is a list of strings like ['WARNING:logger:message...', ...]
+            # We join them into a single blob to search easily.
+            log_text = " ".join(cm.output)
+
+            # Check for D-optimality warning
+            self.assertIn(
+                f"FIM determinant is less than or equal to {_SMALL_TOLERANCE_SINGULARITY},"
+                + " setting D-optimality to -inf",
+                log_text,
+            )
+
+            # Check for A-optimality warning
+            self.assertIn(
+                f"FIM trace is less than or equal to {_SMALL_TOLERANCE_SINGULARITY},"
+                + " setting A-optimality to -inf",
+                log_text,
+            )
+
+            # Check for E-optimality warning
+            self.assertIn(
+                "Smallest eigenvalue of FIM is less than or equal to "
+                + f"{_SMALL_TOLERANCE_SINGULARITY}, setting E-optimality to -inf",
+                log_text,
+            )
+
+            # Check for Modified E-optimality warning
+            self.assertIn("FIM condition number is infinite", log_text)
+
+        # For nonsingular FIM, the warnings should not be logged
+        with self.assertNoLogs("pyomo.contrib.doe.utils", level="WARNING") as cm:
+            FIM = np.array([[4, 1], [1, 3]])
+            # Call the function; no warnings should be triggered
+            compute_FIM_metrics(FIM)
 
     def test_FIM_eigenvalue_warning(self):
         # Create a matrix with an imaginary component large enough

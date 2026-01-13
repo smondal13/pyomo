@@ -154,28 +154,42 @@ def compute_FIM_metrics(FIM):
     E_vecs : numpy.ndarray
         2D array of eigenvectors of the FIM.
     D_opt : float
-        log10(D-optimality) metric.
+        log10(D-optimality) metric. If the determinant is less than 1e-16,
+        D_opt is set to -inf.
     A_opt : float
-        log10(A-optimality) metric.
+        log10(A-optimality) metric. If the trace is less than 1e-16, A_opt is set to -inf.
     E_opt : float
-        log10(E-optimality) metric.
+        log10(E-optimality) metric. If the smallest eigenvalue is less than 1e-16,
+        E_opt is set to -inf.
     ME_opt : float
-        log10(Modified E-optimality) metric.
+        log10(Modified E-optimality) metric. If the np.isinf(condition number) is True,
+        ME_opt is set to inf.
     """
     # Check whether the FIM is square, positive definite, and symmetric
     check_FIM(FIM)
 
     # Compute FIM metrics
-    det_FIM = np.linalg.det(FIM)
+    # Silence NumPy's internal warnings for singular matrix
+    with np.errstate(divide="ignore", invalid="ignore"):
+        det_FIM = np.linalg.det(FIM)
+
     # If the determinant is effectively less than 0, set D_opt to -inf
     if det_FIM <= _SMALL_TOLERANCE_SINGULARITY:
         D_opt = -np.inf
+        logger.warning(
+            "FIM determinant is less than or equal to "
+            + f"{_SMALL_TOLERANCE_SINGULARITY}, setting D-optimality to -inf."
+        )
     else:
         D_opt = np.log10(det_FIM)
 
     trace_FIM = np.trace(FIM)
     if trace_FIM <= _SMALL_TOLERANCE_SINGULARITY:
         A_opt = -np.inf
+        logger.warning(
+            "FIM trace is less than or equal to "
+            + f"{_SMALL_TOLERANCE_SINGULARITY}, setting A-optimality to -inf."
+        )
     else:
         A_opt = np.log10(trace_FIM)
 
@@ -192,12 +206,19 @@ def compute_FIM_metrics(FIM):
     # If the real value is less than or equal to zero, set the E_opt value to nan
     if E_vals.real[E_ind] <= _SMALL_TOLERANCE_SINGULARITY:
         E_opt = -np.inf
+        logger.warning(
+            "Smallest eigenvalue of FIM is less than or equal to "
+            + f"{_SMALL_TOLERANCE_SINGULARITY}, setting E-optimality to -inf."
+        )
     else:
         E_opt = np.log10(E_vals.real[E_ind])
 
     cond_num = np.linalg.cond(FIM)
     if np.isinf(cond_num):
         ME_opt = np.inf
+        logger.warning(
+            "FIM condition number is infinite, setting Modified E-optimality to inf."
+        )
     else:
         ME_opt = np.log10(cond_num)
 
