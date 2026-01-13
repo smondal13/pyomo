@@ -62,9 +62,9 @@ class TestUtilsFIM(unittest.TestCase):
         ):
             check_FIM(FIM)
 
-    """Test the compute_FIM_metrics() from utils.py."""
+    """Test the compute_FIM_metrics() from utils.py for nonsingular FIM."""
 
-    def test_compute_FIM_metrics(self):
+    def test_compute_FIM_metrics_nonsingular(self):
         # Create a sample Fisher Information Matrix (FIM)
         FIM = np.array([[10, 2], [2, 3]])
 
@@ -92,6 +92,43 @@ class TestUtilsFIM(unittest.TestCase):
         self.assertAlmostEqual(trace_FIM, trace_expected)
         self.assertTrue(np.allclose(E_vals, E_vals_expected))
         self.assertTrue(np.allclose(E_vecs, E_vecs_expected))
+        self.assertAlmostEqual(D_opt, D_opt_expected)
+        self.assertAlmostEqual(A_opt, A_opt_expected)
+        self.assertAlmostEqual(E_opt, E_opt_expected)
+        self.assertAlmostEqual(ME_opt, ME_opt_expected)
+
+    """Test the compute_FIM_metrics() from utils.py for singular FIM."""
+
+    def test_compute_FIM_metrics_singular(self):
+        """
+        Test the robustness of compute_FIM_metrics() when the FIM is singular.
+        """
+        # Create a singular FIM
+        FIM = np.zeros((2, 2))
+        (det_FIM, trace_FIM, E_vals, E_vecs, D_opt, A_opt, E_opt, ME_opt) = (
+            compute_FIM_metrics(FIM)
+        )
+        # expected results
+        det_expected = 0
+        D_opt_expected = -np.inf
+
+        trace_expected = 0
+        A_opt_expected = -np.inf
+
+        E_vals_expected = np.array([0, 0])
+        E_vecs_expected = np.array([[1, 0], [0, 1]])
+        E_opt_expected = -np.inf
+
+        ME_opt_expected = np.inf
+
+        # Test results
+        self.assertAlmostEqual(det_FIM, det_expected)
+        self.assertAlmostEqual(trace_FIM, trace_expected)
+        self.assertTrue(np.allclose(E_vals, E_vals_expected))
+        self.assertTrue(
+            np.allclose(E_vecs, E_vecs_expected),
+            msg=f"Expected eigenvectors to be identity, got \n{E_vecs}",
+        )
         self.assertAlmostEqual(D_opt, D_opt_expected)
         self.assertAlmostEqual(A_opt, A_opt_expected)
         self.assertAlmostEqual(E_opt, E_opt_expected)

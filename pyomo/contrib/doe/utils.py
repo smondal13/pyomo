@@ -56,6 +56,12 @@ _SMALL_TOLERANCE_SYMMETRY = 1e-6
 # below and the tests. The user should not need to adjust it.
 _SMALL_TOLERANCE_IMG = 1e-6
 
+# This small and positive tolerance is used to check
+# if any value is practically zero or singularity.
+# It is defined as a tolerance here to ensure consistency between the code
+# below and the tests. The user should not need to adjust it.
+_SMALL_TOLERANCE_SINGULARITY = 1e-16
+
 
 # Rescale FIM (a scaling function to help rescale FIM from parameter values)
 def rescale_FIM(FIM, param_vals):
@@ -156,16 +162,22 @@ def compute_FIM_metrics(FIM):
     ME_opt : float
         log10(Modified E-optimality) metric.
     """
-
     # Check whether the FIM is square, positive definite, and symmetric
     check_FIM(FIM)
 
     # Compute FIM metrics
     det_FIM = np.linalg.det(FIM)
-    D_opt = np.log10(det_FIM)
+    # If the determinant is effectively less than 0, set D_opt to -inf
+    if det_FIM <= _SMALL_TOLERANCE_SINGULARITY:
+        D_opt = -np.inf
+    else:
+        D_opt = np.log10(det_FIM)
 
     trace_FIM = np.trace(FIM)
-    A_opt = np.log10(trace_FIM)
+    if trace_FIM <= _SMALL_TOLERANCE_SINGULARITY:
+        A_opt = -np.inf
+    else:
+        A_opt = np.log10(trace_FIM)
 
     E_vals, E_vecs = np.linalg.eig(FIM)
     E_ind = np.argmin(E_vals.real)  # index of smallest eigenvalue
@@ -178,12 +190,16 @@ def compute_FIM_metrics(FIM):
         )
 
     # If the real value is less than or equal to zero, set the E_opt value to nan
-    if E_vals.real[E_ind] <= 0:
-        E_opt = np.nan
+    if E_vals.real[E_ind] <= _SMALL_TOLERANCE_SINGULARITY:
+        E_opt = -np.inf
     else:
         E_opt = np.log10(E_vals.real[E_ind])
 
-    ME_opt = np.log10(np.linalg.cond(FIM))
+    cond_num = np.linalg.cond(FIM)
+    if np.isinf(cond_num):
+        ME_opt = np.inf
+    else:
+        ME_opt = np.log10(cond_num)
 
     return det_FIM, trace_FIM, E_vals, E_vecs, D_opt, A_opt, E_opt, ME_opt
 
