@@ -80,7 +80,7 @@ class TestReactorExampleErrors(unittest.TestCase):
         flag_val = 1  # Value for faulty model build mode - 1: No exp outputs
 
         with self.assertRaisesRegex(
-            ValueError, "Experiment object must be provided to perform DoE."
+            ValueError, "The 'experiment_list' parameter must be provided"
         ):
             # Experiment provided as None
             DoE_args = get_standard_args(None, fd_method, obj_used, flag_val)
@@ -96,7 +96,7 @@ class TestReactorExampleErrors(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            "The experiment object must have a ``get_labeled_model`` function",
+            "Experiment at index .* must have a.*get_labeled_model",
         ):
             DoE_args = get_standard_args(experiment, fd_method, obj_used, flag_val)
 
