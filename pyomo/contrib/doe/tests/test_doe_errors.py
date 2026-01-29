@@ -97,8 +97,7 @@ class TestReactorExampleErrors(unittest.TestCase):
         experiment = BadExperiment()
 
         with self.assertRaisesRegex(
-            ValueError,
-            "Experiment at index .* must have a.*get_labeled_model",
+            ValueError, "Experiment at index .* must have a.*get_labeled_model"
         ):
             DoE_args = get_standard_args(experiment, fd_method, obj_used, flag_val)
 
