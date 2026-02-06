@@ -701,7 +701,7 @@ class DesignOfExperiments:
                 var_local_name = sym_break_var.local_name
                 self.logger.warning(
                     f"No symmetry breaking variable specified. Automatically using the first "
-                    f"experiment input '{var_local_name}' for ordering constraints. "
+                    f"experiment input '{sym_break_var.local_name}' for ordering constraints. "
                     f"To specify a different variable, add: "
                     f"m.sym_break_cons = pyo.Suffix(direction=pyo.Suffix.LOCAL); "
                     f"m.sym_break_cons[m.your_variable] = None"
@@ -1013,7 +1013,9 @@ class DesignOfExperiments:
 
         # Store variable names once (structural properties, same across all scenarios/experiments)
         # Use first scenario's first experiment to get the structure
-        first_exp_block_fd = self.model.param_scenario_blocks[0].exp_blocks[0].fd_scenario_blocks[0]
+        first_exp_block_fd = (
+            self.model.param_scenario_blocks[0].exp_blocks[0].fd_scenario_blocks[0]
+        )
         self.results["Experiment Design Names"] = [
             str(pyo.ComponentUID(comp, context=first_exp_block_fd))
             for comp in first_exp_block_fd.experiment_inputs
