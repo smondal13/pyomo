@@ -698,7 +698,6 @@ class DesignOfExperiments:
                 # Note: experiment_inputs is validated earlier to be non-empty
                 sym_break_var = next(iter(first_exp_block.experiment_inputs))
                 # Extract just the variable name without the full hierarchical path
-                var_local_name = sym_break_var.local_name
                 self.logger.warning(
                     f"No symmetry breaking variable specified. Automatically using the first "
                     f"experiment input '{sym_break_var.local_name}' for ordering constraints. "
