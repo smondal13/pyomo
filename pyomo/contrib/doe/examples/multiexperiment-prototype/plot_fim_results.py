@@ -22,7 +22,7 @@ from pyomo.contrib.doe.utils import compute_FIM_metrics
 script_dir = Path(__file__).parent
 
 # Read the results file from the same directory as this script
-with open(script_dir / 'rooney_biegler_fim_2exp_verification.json', 'r') as f:
+with open(script_dir / 'rooney_biegler_fim_2exp_verification_w_o_prior.json', 'r') as f:
     data = json.load(f)
 
 # Convert results to DataFrame

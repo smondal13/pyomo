@@ -691,15 +691,17 @@ class DesignOfExperiments:
 
                 sym_break_var = sym_break_var_list[0]
                 self.logger.info(
-                    f"Using user-specified variable '{sym_break_var.name}' for symmetry breaking."
+                    f"Using user-specified variable '{sym_break_var.local_name}' for symmetry breaking."
                 )
             else:
                 # Use first experiment input as default symmetry breaking variable
                 # Note: experiment_inputs is validated earlier to be non-empty
                 sym_break_var = next(iter(first_exp_block.experiment_inputs))
+                # Extract just the variable name without the full hierarchical path
+                var_local_name = sym_break_var.local_name
                 self.logger.warning(
                     f"No symmetry breaking variable specified. Automatically using the first "
-                    f"experiment input '{sym_break_var.name}' for ordering constraints. "
+                    f"experiment input '{var_local_name}' for ordering constraints. "
                     f"To specify a different variable, add: "
                     f"m.sym_break_cons = pyo.Suffix(direction=pyo.Suffix.LOCAL); "
                     f"m.sym_break_cons[m.your_variable] = None"
