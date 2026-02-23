@@ -45,15 +45,18 @@ measurement_error = 0.1
 
 print("Computing prior FIM from existing data...")
 FIM_0 = np.zeros((2, 2))
-for i in range(len(data)):
-    exp_data = data.loc[i, :]
-    exp = RooneyBieglerExperimentParmest(
-        data=exp_data, theta=theta, measure_error=measurement_error
-    )
-    doe_obj = DesignOfExperiments(
-        experiment_list=exp, objective_option='determinant', prior_FIM=None, tee=False
-    )
-    FIM_0 += doe_obj.compute_FIM()
+use_prior = False
+if use_prior:
+    for i in range(len(data)):
+        exp_data = data.loc[i, :]
+        exp = RooneyBieglerExperimentParmest(
+            data=exp_data, theta=theta, measure_error=measurement_error
+        )
+        doe_obj = DesignOfExperiments(
+            experiment_list=exp, objective_option='determinant', prior_FIM=None, tee=False
+        )
+        FIM_0 += doe_obj.compute_FIM()
+    
 
 
 def run_doe_optimization(objective_option, prior_FIM, theta, measurement_error):
@@ -110,10 +113,11 @@ def run_doe_optimization(objective_option, prior_FIM, theta, measurement_error):
     return best_h, best_val
 
 
-print("\nRunning optimize_experiments with prior FIM (FIM_0)...")
+print(f"\nRunning optimize_experiments {'with' if use_prior else 'without'} prior FIM...")
+prior_for_opt = FIM_0 if use_prior else None
 opt_with_prior = {}
 for obj in ('determinant', 'trace', 'pseudo_trace'):
-    h, v = run_doe_optimization(obj, FIM_0.copy(), theta, measurement_error)
+    h, v = run_doe_optimization(obj, prior_for_opt, theta, measurement_error)
     opt_with_prior[obj] = h
     print(f"  {obj}: h=({h[0]:.4f}, {h[1]:.4f}), metric={v:.4f}")
 
@@ -149,9 +153,19 @@ for idx, row in results_df.iterrows():
                 ME_opt,
             ) = compute_FIM_metrics(FIM)
 
-            d_optimality.append(D_opt)
-            a_optimality.append(A_opt)
-            pseudo_a_optimality.append(pseudo_A_opt)
+            # If the FIM is singular (det <= 0), D_opt is NaN.
+            # A_opt (trace of inverse/covariance) is meaningless for a singular FIM —
+            # pinv gives a finite but incorrect result, so mark it NaN.
+            # pseudo_A_opt (trace of FIM itself) is still valid for singular matrices,
+            # so keep it.
+            if np.isnan(D_opt):
+                d_optimality.append(np.nan)
+                a_optimality.append(np.nan)          # invalid: FIM not invertible
+                pseudo_a_optimality.append(pseudo_A_opt)  # valid: no inversion needed
+            else:
+                d_optimality.append(D_opt)
+                a_optimality.append(A_opt)
+                pseudo_a_optimality.append(pseudo_A_opt)
         except Exception as e:
             print(f"compute_FIM_metrics failed at idx={idx}: {e}")
             try:
@@ -258,6 +272,7 @@ def create_metric_grid(df, metric_name):
 
 
 # 1. D-optimality plot
+_opt_label_suffix = 'with prior' if use_prior else 'no prior'
 ax1 = axes[0]
 Z_d = create_metric_grid(results_df, 'D_optimality')
 contour1 = ax1.contourf(H1, H2, Z_d, levels=20, cmap='viridis')
@@ -285,7 +300,7 @@ ax1.scatter(
     edgecolors='black',
     linewidths=1.5,
     alpha=1.0,
-    label=f'Opt (with prior): ({opt_with_prior["determinant"][0]:.2f}, {opt_with_prior["determinant"][1]:.2f})',
+    label=f'Opt ({_opt_label_suffix}): ({opt_with_prior["determinant"][0]:.2f}, {opt_with_prior["determinant"][1]:.2f})',
     zorder=9,
     clip_on=False,
 )
@@ -327,7 +342,7 @@ ax2.scatter(
     edgecolors='black',
     linewidths=1.5,
     alpha=1.0,
-    label=f'Opt (with prior): ({opt_with_prior["trace"][0]:.2f}, {opt_with_prior["trace"][1]:.2f})',
+    label=f'Opt ({_opt_label_suffix}): ({opt_with_prior["trace"][0]:.2f}, {opt_with_prior["trace"][1]:.2f})',
     zorder=9,
     clip_on=False,
 )
@@ -369,7 +384,7 @@ ax3.scatter(
     edgecolors='black',
     linewidths=1.5,
     alpha=1.0,
-    label=f'Opt (with prior): ({opt_with_prior["pseudo_trace"][0]:.2f}, {opt_with_prior["pseudo_trace"][1]:.2f})',
+    label=f'Opt ({_opt_label_suffix}): ({opt_with_prior["pseudo_trace"][0]:.2f}, {opt_with_prior["pseudo_trace"][1]:.2f})',
     zorder=9,
     clip_on=False,
 )
