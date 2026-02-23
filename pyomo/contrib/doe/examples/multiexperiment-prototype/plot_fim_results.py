@@ -10,13 +10,15 @@ import pandas as pd
 from pathlib import Path
 import sys
 from pyomo.contrib.parmest.examples.rooney_biegler.rooney_biegler import (
-    RooneyBieglerExperiment,
+    RooneyBieglerExperiment as RooneyBieglerExperimentParmest,
 )
 from pyomo.contrib.doe import DesignOfExperiments
 
-# Add the parent directory to the path to import from pyomo.contrib.doe
+# Add pyomo root and local prototype directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 from pyomo.contrib.doe.utils import compute_FIM_metrics
+from rooney_biegler_multiexperiment import RooneyBieglerExperiment as RBExperiment
 
 # Get the directory where this script is located
 script_dir = Path(__file__).parent
@@ -45,13 +47,75 @@ print("Computing prior FIM from existing data...")
 FIM_0 = np.zeros((2, 2))
 for i in range(len(data)):
     exp_data = data.loc[i, :]
-    exp = RooneyBieglerExperiment(
+    exp = RooneyBieglerExperimentParmest(
         data=exp_data, theta=theta, measure_error=measurement_error
     )
     doe_obj = DesignOfExperiments(
         experiment_list=exp, objective_option='determinant', prior_FIM=None, tee=False
     )
     FIM_0 += doe_obj.compute_FIM()
+
+
+def run_doe_optimization(objective_option, prior_FIM, theta, measurement_error):
+    """
+    Run optimize_experiments for 2 experiments and return the optimal (h1, h2).
+    Initial point for both experiments is hour=1 (low) and hour=7 (high) to
+    help find the global basin regardless of prior.
+    """
+    # Use two different starting points
+    best_val = None
+    best_h = None
+    metric_key = {
+        'determinant': 'log10 D-opt',
+        'trace': 'log10 A-opt',
+        'pseudo_trace': 'log10 pseudo A-opt',
+    }[objective_option]
+    maximise = objective_option in ('determinant', 'pseudo_trace')
+
+    for h1_init, h2_init in [(1.0, 2.0), (5.0, 5.0), (9.0, 9.0)]:
+        exp_list = [
+            RBExperiment(
+                data=pd.Series({'hour': h_init, 'y': 10.0}),
+                theta=theta,
+                measure_error=measurement_error,
+            )
+            for h_init in (h1_init, h2_init)
+        ]
+        try:
+            doe = DesignOfExperiments(
+                experiment_list=exp_list,
+                objective_option=objective_option,
+                prior_FIM=prior_FIM,
+                tee=False,
+                _Cholesky_option=True,
+                _only_compute_fim_lower=True,
+            )
+            doe.optimize_experiments()
+            scen = doe.results['Scenarios'][0]
+            val = scen.get(metric_key)
+            if val is None:
+                continue
+            is_better = (
+                best_val is None
+                or (maximise and val > best_val)
+                or (not maximise and val < best_val)
+            )
+            if is_better:
+                best_val = val
+                best_h = tuple(
+                    exp['Experiment Design'][0] for exp in scen['Experiments']
+                )
+        except Exception as e:
+            print(f"  Optimization failed for {objective_option} init=({h1_init},{h2_init}): {e}")
+    return best_h, best_val
+
+
+print("\nRunning optimize_experiments with prior FIM (FIM_0)...")
+opt_with_prior = {}
+for obj in ('determinant', 'trace', 'pseudo_trace'):
+    h, v = run_doe_optimization(obj, FIM_0.copy(), theta, measurement_error)
+    opt_with_prior[obj] = h
+    print(f"  {obj}: h=({h[0]:.4f}, {h[1]:.4f}), metric={v:.4f}")
 
 # Compute metrics for each result
 d_optimality = []
@@ -103,7 +167,6 @@ for idx, row in results_df.iterrows():
     else:
         d_optimality.append(np.nan)
         a_optimality.append(np.nan)
-        pseudo_a_optimality.append(np.nan)
         pseudo_a_optimality.append(np.nan)
 
 # Add metrics to dataframe
@@ -171,14 +234,26 @@ print(f"\nGrid size: {len(hour1_unique)} x {len(hour2_unique)}")
 # Create meshgrid
 H1, H2 = np.meshgrid(hour1_unique, hour2_unique)
 
+# Axis limits: pad the grid range so boundary markers are fully visible
+_h_min = min(hour1_unique.min(), hour2_unique.min())
+_h_max = max(hour1_unique.max(), hour2_unique.max())
+_pad = (_h_max - _h_min) * 0.07
+_xlim = (_h_min - _pad, _h_max + _pad)
+_ylim = (_h_min - _pad, _h_max + _pad)
+
 
 # Helper function to create grid for metric
+# The stored data only covers combinations_with_replacement (hour1 <= hour2),
+# but FIM is additive so FIM(h1,h2) = FIM(h2,h1). Mirror the symmetric half.
 def create_metric_grid(df, metric_name):
     Z = np.full(H1.shape, np.nan)
     for idx, row in df.iterrows():
+        val = row[metric_name] if not np.isnan(row[metric_name]) else np.nan
         i = np.where(hour2_unique == row['hour2'])[0][0]
         j = np.where(hour1_unique == row['hour1'])[0][0]
-        Z[i, j] = row[metric_name] if not np.isnan(row[metric_name]) else np.nan
+        Z[i, j] = val
+        # Mirror: swap hour1/hour2 roles (symmetric)
+        Z[j, i] = val
     return Z
 
 
@@ -191,26 +266,28 @@ ax1.scatter(
     [best_d['hour1']],
     [best_d['hour2']],
     color='red',
-    s=350,
+    s=600,
     marker='*',
-    edgecolors='white',
-    linewidths=2,
-    alpha=0.95,
-    label=f'Optimal: ({best_d["hour1"]:.2f}, {best_d["hour2"]:.2f})',
-    zorder=5,
-)
-# Plot optimal point from optimize_experiments()
-ax1.scatter(
-    1.93,
-    10.0,
-    color='cyan',
-    s=200,
-    marker='X',
     edgecolors='black',
     linewidths=1.5,
-    alpha=0.9,
-    label='Optimum from optimization',
-    zorder=5,
+    alpha=1.0,
+    label=f'Brute-force best: ({best_d["hour1"]:.2f}, {best_d["hour2"]:.2f})',
+    zorder=10,
+    clip_on=False,
+)
+# Optimum from optimize_experiments() with prior FIM
+ax1.scatter(
+    opt_with_prior['determinant'][0],
+    opt_with_prior['determinant'][1],
+    color='orange',
+    s=400,
+    marker='P',
+    edgecolors='black',
+    linewidths=1.5,
+    alpha=1.0,
+    label=f'Opt (with prior): ({opt_with_prior["determinant"][0]:.2f}, {opt_with_prior["determinant"][1]:.2f})',
+    zorder=9,
+    clip_on=False,
 )
 ax1.set_xlabel('Hour 1', fontsize=12)
 ax1.set_ylabel('Hour 2', fontsize=12)
@@ -218,6 +295,8 @@ ax1.set_title(
     'D-Optimality (Maximize)\nlog10(det(FIM))', fontsize=13, fontweight='bold'
 )
 ax1.legend(loc='best', fontsize=9)
+ax1.set_xlim(_xlim)
+ax1.set_ylim(_ylim)
 ax1.grid(True, alpha=0.3)
 fig.colorbar(contour1, ax=ax1, label='log10(det(FIM))')
 
@@ -230,25 +309,27 @@ ax2.scatter(
     [best_a['hour1']],
     [best_a['hour2']],
     color='red',
-    s=350,
+    s=600,
     marker='*',
-    edgecolors='white',
-    linewidths=2,
-    alpha=0.95,
-    label=f'Optimal: ({best_a["hour1"]:.2f}, {best_a["hour2"]:.2f})',
-    zorder=5,
-)
-ax2.scatter(
-    0.9728,
-    10.0,
-    color='cyan',
-    s=200,
-    marker='X',
     edgecolors='black',
     linewidths=1.5,
-    alpha=0.9,
-    label='Optimum from optimization',
-    zorder=5,
+    alpha=1.0,
+    label=f'Brute-force best: ({best_a["hour1"]:.2f}, {best_a["hour2"]:.2f})',
+    zorder=10,
+    clip_on=False,
+)
+ax2.scatter(
+    opt_with_prior['trace'][0],
+    opt_with_prior['trace'][1],
+    color='orange',
+    s=400,
+    marker='P',
+    edgecolors='black',
+    linewidths=1.5,
+    alpha=1.0,
+    label=f'Opt (with prior): ({opt_with_prior["trace"][0]:.2f}, {opt_with_prior["trace"][1]:.2f})',
+    zorder=9,
+    clip_on=False,
 )
 ax2.set_xlabel('Hour 1', fontsize=12)
 ax2.set_ylabel('Hour 2', fontsize=12)
@@ -256,6 +337,8 @@ ax2.set_title(
     'A-Optimality (Minimize)\nlog10(trace(FIM⁻¹))', fontsize=13, fontweight='bold'
 )
 ax2.legend(loc='best', fontsize=9)
+ax2.set_xlim(_xlim)
+ax2.set_ylim(_ylim)
 ax2.grid(True, alpha=0.3)
 fig.colorbar(contour2, ax=ax2, label='log10(trace(cov))')
 
@@ -268,25 +351,27 @@ ax3.scatter(
     [best_pa['hour1']],
     [best_pa['hour2']],
     color='red',
-    s=350,
+    s=600,
     marker='*',
-    edgecolors='white',
-    linewidths=2,
-    alpha=0.95,
-    label=f'Optimal: ({best_pa["hour1"]:.2f}, {best_pa["hour2"]:.2f})',
-    zorder=5,
-)
-ax3.scatter(
-    2.0037,
-    2.0039,
-    color='cyan',
-    s=200,
-    marker='X',
     edgecolors='black',
     linewidths=1.5,
-    alpha=0.9,
-    label='Optimum from optimization',
-    zorder=5,
+    alpha=1.0,
+    label=f'Brute-force best: ({best_pa["hour1"]:.2f}, {best_pa["hour2"]:.2f})',
+    zorder=10,
+    clip_on=False,
+)
+ax3.scatter(
+    opt_with_prior['pseudo_trace'][0],
+    opt_with_prior['pseudo_trace'][1],
+    color='orange',
+    s=400,
+    marker='P',
+    edgecolors='black',
+    linewidths=1.5,
+    alpha=1.0,
+    label=f'Opt (with prior): ({opt_with_prior["pseudo_trace"][0]:.2f}, {opt_with_prior["pseudo_trace"][1]:.2f})',
+    zorder=9,
+    clip_on=False,
 )
 
 
@@ -296,6 +381,8 @@ ax3.set_title(
     'Pseudo-A-Optimality (Maximize)\nlog10(trace(FIM))', fontsize=13, fontweight='bold'
 )
 ax3.legend(loc='best', fontsize=9)
+ax3.set_xlim(_xlim)
+ax3.set_ylim(_ylim)
 ax3.grid(True, alpha=0.3)
 fig.colorbar(contour3, ax=ax3, label='log10(trace(FIM))')
 

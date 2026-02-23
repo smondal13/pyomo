@@ -181,7 +181,7 @@ def run_rooney_biegler_multi_experiment_doe(
         print(f"  log10 A-opt: {scenario['log10 A-opt']:.4f}")
         print(f"  log10 D-opt: {scenario['log10 D-opt']:.4f}")
         print(f"  log10 E-opt: {scenario['log10 E-opt']:.4f}")
-        print(f"  log10 ME-opt: {np.log10(scenario['FIM Condition Number']):.4f}")
+        print(f"  log10 ME-opt: {scenario['log10 ME-opt']:.4f}")
 
         # Print each experiment design
         for exp_idx, exp in enumerate(scenario['Experiments']):
@@ -195,6 +195,137 @@ def run_rooney_biegler_multi_experiment_doe(
     print(f"\n{'='*60}\n")
 
     return doe_obj
+
+
+def run_multistart_doe(
+    starting_hours,
+    theta,
+    measurement_error,
+    objective_option="determinant",
+    prior_FIM=None,
+    tee=False,
+):
+    """
+    Run multi-start optimization to escape local optima.
+
+    Tries every combination of initial hour values, runs optimize_experiments
+    from each starting point, and returns the best result found.
+
+    Parameters
+    ----------
+    starting_hours : list of float
+        Grid of hour values to use as starting points for each experiment.
+        All 2-combinations (with replacement) are tried.
+    theta : dict
+        Parameter nominal values.
+    measurement_error : float
+        Measurement error magnitude.
+    objective_option : str
+        One of 'determinant', 'trace', 'pseudo_trace'.
+    prior_FIM : np.ndarray, optional
+        Prior FIM.
+    tee : bool
+        Show IPOPT output.
+
+    Returns
+    -------
+    best_doe : DesignOfExperiments
+        DoE object for the best start found.
+    best_hours : tuple
+        (h1_start, h2_start) of the winning starting point.
+    summary : list of dict
+        Objective value and starting hours for every trial.
+    """
+    from itertools import combinations_with_replacement
+
+    # Map objective to the metric we compare (D-opt maximise, A-opt minimise,
+    # pseudo_trace maximise).
+    maximise = objective_option in ('determinant', 'pseudo_trace')
+    metric_key = {
+        'determinant': 'log10 D-opt',
+        'trace': 'log10 A-opt',
+        'pseudo_trace': 'log10 pseudo A-opt',
+    }[objective_option]
+
+    best_doe = None
+    best_val = None
+    best_hours = None
+    summary = []
+    n_trials = 0
+
+    trials = list(combinations_with_replacement(starting_hours, 2))
+    print(f"\n{'#'*70}")
+    print(f"Multi-start DOE | objective={objective_option} | {len(trials)} starts")
+    print(f"{'#'*70}")
+
+    for h1_init, h2_init in trials:
+        n_trials += 1
+        print(f"\n--- Trial {n_trials}/{len(trials)}: init h1={h1_init:.2f}, h2={h2_init:.2f} ---")
+
+        # Build experiment list initialised at (h1_init, h2_init)
+        exp_list = []
+        for h_init in (h1_init, h2_init):
+            init_data = pd.Series({'hour': h_init, 'y': 10.0})
+            exp_list.append(
+                RooneyBieglerExperiment(
+                    data=init_data, theta=theta, measure_error=measurement_error
+                )
+            )
+
+        try:
+            doe_obj = DesignOfExperiments(
+                experiment_list=exp_list,
+                objective_option=objective_option,
+                prior_FIM=prior_FIM,
+                tee=tee,
+                _Cholesky_option=True,
+                _only_compute_fim_lower=True,
+            )
+            doe_obj.optimize_experiments()
+
+            # Extract objective value from first scenario
+            scenario = doe_obj.results['Scenarios'][0]
+            val = scenario.get(metric_key)
+
+            if val is None:
+                print(f"  Could not extract metric from scenario keys: {list(scenario.keys())}")
+                summary.append({'h1_init': h1_init, 'h2_init': h2_init, 'val': None, 'status': 'metric_missing'})
+                continue
+
+            # Retrieve the solved hour values
+            exp_designs = [
+                exp['Experiment Design'][0]
+                for exp in scenario['Experiments']
+            ]
+
+            print(f"  Solved: h1={exp_designs[0]:.4f}, h2={exp_designs[1]:.4f}, metric={val:.4f}")
+            summary.append({'h1_init': h1_init, 'h2_init': h2_init, 'val': val,
+                            'h1_opt': exp_designs[0], 'h2_opt': exp_designs[1],
+                            'status': str(doe_obj.results['Termination Condition'])})
+
+            is_better = (
+                best_val is None
+                or (maximise and val > best_val)
+                or (not maximise and val < best_val)
+            )
+            if is_better:
+                best_val = val
+                best_doe = doe_obj
+                best_hours = (h1_init, h2_init)
+
+        except Exception as e:
+            print(f"  Failed: {e}")
+            summary.append({'h1_init': h1_init, 'h2_init': h2_init, 'val': None, 'status': f'error: {e}'})
+
+    print(f"\n{'='*70}")
+    print(f"Multi-start complete | best metric={best_val:.4f} | from start={best_hours}")
+    if best_doe is not None:
+        best_scen = best_doe.results['Scenarios'][0]
+        best_designs = [exp['Experiment Design'][0] for exp in best_scen['Experiments']]
+        print(f"Best design: h1={best_designs[0]:.4f}, h2={best_designs[1]:.4f}")
+    print(f"{'='*70}\n")
+
+    return best_doe, best_hours, summary
 
 
 if __name__ == "__main__":
@@ -235,51 +366,96 @@ if __name__ == "__main__":
         doe_data = DesignOfExperiments(experiment_list=[exp], step=0.01)
         p_FIM += doe_data.compute_FIM()
 
+    # Starting hours for multi-start: 5 evenly spaced points across [0.5, 9.5]
+    # so the optimizer can explore both the low-hour and high-hour basins.
+    starting_hours = [0.5, 2.5, 5.0, 7.5, 9.5]
+
+    comparison = {}  # objective -> {single: ..., multistart: ...}
+
     for obj_option in objective_options:
         print(f"\n\n{'#'*70}")
-        print(f"# Running with objective: {obj_option}")
+        print(f"# Objective: {obj_option}")
         print(f"{'#'*70}")
 
-        # Create multiple experiment objects with different hour values
-        n_exp = 2
-        experiment_list = []
-
-        print(f"\nCreating and initializing {n_exp} experiments...")
-        for i in range(n_exp):
-            # Use different rows from the dataframe for each experiment
+        # ---- Single-start (original behaviour, init at hour=1 and hour=2) ----
+        print(f"\n--- Single-start (init: hour=1, hour=2) ---")
+        single_exp_list = []
+        for i in range(2):
             exp_data = data.loc[i, :]
-            exp = RooneyBieglerExperiment(
-                data=exp_data, theta=theta, measure_error=measurement_error
+            single_exp_list.append(
+                RooneyBieglerExperiment(
+                    data=exp_data, theta=theta, measure_error=measurement_error
+                )
             )
-            experiment_list.append(exp)
-            print(f"  Experiment {i+1} created (hour={exp_data['hour']:.1f})")
-
-        # Run multi-experiment optimization
-        doe_obj = run_rooney_biegler_multi_experiment_doe(
-            experiment_list=experiment_list,
+        doe_single = run_rooney_biegler_multi_experiment_doe(
+            experiment_list=single_exp_list,
             objective_option=obj_option,
             prior_FIM=p_FIM,
             tee=False,
         )
+        single_scenario = doe_single.results['Scenarios'][0]
+        single_designs = [
+            exp['Experiment Design'][0] for exp in single_scenario['Experiments']
+        ]
+        single_d_opt = single_scenario['log10 D-opt']
+        single_a_opt = single_scenario['log10 A-opt']
 
-        # Extract and save results
+        # ---- Multi-start ----
+        best_doe, best_start, ms_summary = run_multistart_doe(
+            starting_hours=starting_hours,
+            theta=theta,
+            measurement_error=measurement_error,
+            objective_option=obj_option,
+            prior_FIM=p_FIM,
+            tee=False,
+        )
+        ms_scenario = best_doe.results['Scenarios'][0]
+        ms_designs = [
+            exp['Experiment Design'][0] for exp in ms_scenario['Experiments']
+        ]
+        ms_d_opt = ms_scenario['log10 D-opt']
+        ms_a_opt = ms_scenario['log10 A-opt']
+
+        comparison[obj_option] = {
+            'single_start': {
+                'init_hours': [1.0, 2.0],
+                'opt_hours': single_designs,
+                'log10_D_opt': single_d_opt,
+                'log10_A_opt': single_a_opt,
+            },
+            'multi_start': {
+                'best_start': list(best_start),
+                'opt_hours': ms_designs,
+                'log10_D_opt': ms_d_opt,
+                'log10_A_opt': ms_a_opt,
+                'all_trials': ms_summary,
+            },
+        }
+
+        print(f"\n  Single-start  → h=({single_designs[0]:.4f}, {single_designs[1]:.4f})"
+              f"  D-opt={single_d_opt:.4f}  A-opt={single_a_opt:.4f}")
+        print(f"  Multi-start   → h=({ms_designs[0]:.4f}, {ms_designs[1]:.4f})"
+              f"  D-opt={ms_d_opt:.4f}  A-opt={ms_a_opt:.4f}")
+
+        # Save best (multi-start) result as the canonical JSON for this objective
         results_summary = {
             'objective_option': obj_option,
-            'solver_status': str(doe_obj.results['Solver Status']),
-            'termination_condition': str(doe_obj.results['Termination Condition']),
-            'n_scenarios': doe_obj.results['Number of Scenarios'],
-            'n_experiments': doe_obj.results['Number of Experiments per Scenario'],
+            'method': 'multi_start',
+            'starting_hours': starting_hours,
+            'best_start': list(best_start),
+            'solver_status': str(best_doe.results['Solver Status']),
+            'termination_condition': str(best_doe.results['Termination Condition']),
+            'n_scenarios': best_doe.results['Number of Scenarios'],
+            'n_experiments': best_doe.results['Number of Experiments per Scenario'],
             'timing': {
-                'build_time': doe_obj.results['Build Time'],
-                'initialization_time': doe_obj.results['Initialization Time'],
-                'solve_time': doe_obj.results['Solve Time'],
-                'total_time': doe_obj.results['Wall-clock Time'],
+                'build_time': best_doe.results['Build Time'],
+                'initialization_time': best_doe.results['Initialization Time'],
+                'solve_time': best_doe.results['Solve Time'],
+                'total_time': best_doe.results['Wall-clock Time'],
             },
             'scenarios': [],
         }
-
-        # Extract scenario results
-        for s_idx, scenario in enumerate(doe_obj.results['Scenarios']):
+        for s_idx, scenario in enumerate(best_doe.results['Scenarios']):
             scenario_data = {
                 'scenario_idx': s_idx,
                 'log10_A_opt': scenario['log10 A-opt'],
@@ -288,25 +464,20 @@ if __name__ == "__main__":
                 'FIM_condition_number': scenario['FIM Condition Number'],
                 'experiments': [],
             }
-
-            # Extract experiment designs
             for exp_idx, exp in enumerate(scenario['Experiments']):
-                exp_data = {'experiment_idx': exp_idx, 'design_variables': {}}
+                exp_entry = {'experiment_idx': exp_idx, 'design_variables': {}}
                 for name, value in zip(
-                    doe_obj.results['Experiment Design Names'], exp['Experiment Design']
+                    best_doe.results['Experiment Design Names'], exp['Experiment Design']
                 ):
-                    exp_data['design_variables'][name] = value
-                scenario_data['experiments'].append(exp_data)
-
+                    exp_entry['design_variables'][name] = value
+                scenario_data['experiments'].append(exp_entry)
             results_summary['scenarios'].append(scenario_data)
 
         all_results[obj_option] = results_summary
-
-        # Save individual results file
         output_file = script_dir / f'rooney_biegler_multiexp_{obj_option}.json'
         with open(output_file, 'w') as f:
             json.dump(results_summary, f, indent=2)
-        print(f"\nResults saved to: {output_file}")
+        print(f"  Results saved to: {output_file}")
 
     # Save combined results
     combined_file = script_dir / 'rooney_biegler_multiexp_all_objectives.json'
@@ -314,6 +485,19 @@ if __name__ == "__main__":
         json.dump(all_results, f, indent=2)
     print(f"\n\nCombined results saved to: {combined_file}")
 
+    # Print final comparison table
     print("\n" + "=" * 70)
-    print("All tests completed successfully!")
+    print("Single-start vs Multi-start Comparison")
     print("=" * 70)
+    print(f"{'Objective':<15} {'Method':<14} {'h1':>8} {'h2':>8} {'D-opt':>10} {'A-opt':>10}")
+    print("-" * 70)
+    for obj, vals in comparison.items():
+        ss = vals['single_start']
+        ms = vals['multi_start']
+        print(f"{obj:<15} {'single-start':<14} {ss['opt_hours'][0]:>8.4f} {ss['opt_hours'][1]:>8.4f}"
+              f" {ss['log10_D_opt']:>10.4f} {ss['log10_A_opt']:>10.4f}")
+        print(f"{'':15} {'multi-start':<14} {ms['opt_hours'][0]:>8.4f} {ms['opt_hours'][1]:>8.4f}"
+              f" {ms['log10_D_opt']:>10.4f} {ms['log10_A_opt']:>10.4f}")
+        print("-" * 70)
+
+    print("\nAll tests completed successfully!")
