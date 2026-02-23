@@ -32,6 +32,7 @@ if scipy_available:
     )
     from pyomo.contrib.doe.tests.experiment_class_example_flags import (
         RooneyBieglerMultiExperiment,
+        RooneyBieglerMultiInputExperimentFlag,
     )
     from pyomo.contrib.parmest.examples.rooney_biegler.rooney_biegler import (
         RooneyBieglerExperiment,
@@ -658,6 +659,13 @@ class TestDoEObjectiveOptions(unittest.TestCase):
 
 
 class TestOptimizeExperimentsBuildStructure(unittest.TestCase):
+    def _make_solver(self):
+        solver = SolverFactory("ipopt")
+        solver.options["linear_solver"] = "ma57"
+        solver.options["halt_on_ampl_error"] = "yes"
+        solver.options["max_iter"] = 3000
+        return solver
+
     def test_get_experiment_input_vars_direct_and_fd_fallback(self):
         doe_obj = DesignOfExperiments(
             experiment_list=[RooneyBieglerMultiExperiment(hour=2.0)],
@@ -687,10 +695,7 @@ class TestOptimizeExperimentsBuildStructure(unittest.TestCase):
 
     @unittest.skipIf(not ipopt_available, "The 'ipopt' command is not available")
     def test_multi_experiment_structure_and_results(self):
-        solver = SolverFactory("ipopt")
-        solver.options["linear_solver"] = "ma57"
-        solver.options["halt_on_ampl_error"] = "yes"
-        solver.options["max_iter"] = 3000
+        solver = self._make_solver()
 
         doe_obj = DesignOfExperiments(
             experiment_list=[
@@ -714,10 +719,64 @@ class TestOptimizeExperimentsBuildStructure(unittest.TestCase):
         self.assertEqual(len(doe_obj.results["Experiment Design Names"]), 1)
         self.assertEqual(len(doe_obj.results["Unknown Parameter Names"]), 2)
 
+        # New structured payload checks
+        self.assertIn("run_info", doe_obj.results)
+        self.assertIn("settings", doe_obj.results)
+        self.assertIn("timing", doe_obj.results)
+        self.assertIn("names", doe_obj.results)
+        self.assertIn("scenarios", doe_obj.results)
+        self.assertEqual(
+            doe_obj.results["run_info"]["solver"]["status"], doe_obj.results["Solver Status"]
+        )
+        self.assertEqual(
+            doe_obj.results["settings"]["modeling"]["n_experiments_per_scenario"], 2
+        )
+        self.assertEqual(len(doe_obj.results["scenarios"]), 1)
+        self.assertEqual(doe_obj.results["scenarios"][0]["id"], 0)
+        self.assertEqual(len(doe_obj.results["scenarios"][0]["experiments"]), 2)
+        self.assertEqual(doe_obj.results["scenarios"][0]["experiments"][0]["id"], 0)
+
         # hour of exp[0] should be <= hour of exp[1] due to symmetry breaking
         h0 = scenario_result["Experiments"][0]["Experiment Design"][0]
         h1 = scenario_result["Experiments"][1]["Experiment Design"][0]
         self.assertLessEqual(h0, h1)
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' command is not available")
+    def test_symmetry_breaking_default_variable_warning(self):
+        doe_obj = DesignOfExperiments(
+            experiment_list=[
+                RooneyBieglerMultiInputExperimentFlag(hour=2.0, sym_break_flag=0),
+                RooneyBieglerMultiInputExperimentFlag(hour=4.0, sym_break_flag=0),
+            ],
+            objective_option="pseudo_trace",
+            step=1e-2,
+            solver=self._make_solver(),
+        )
+        with self.assertLogs("pyomo.contrib.doe.doe", level="WARNING") as cm:
+            doe_obj.optimize_experiments()
+        self.assertTrue(
+            any("No symmetry breaking variable specified" in msg for msg in cm.output)
+        )
+        self.assertTrue(
+            hasattr(doe_obj.model.param_scenario_blocks[0], "symmetry_breaking_s0_exp1")
+        )
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' command is not available")
+    def test_symmetry_breaking_multiple_markers_warning(self):
+        doe_obj = DesignOfExperiments(
+            experiment_list=[
+                RooneyBieglerMultiInputExperimentFlag(hour=2.0, sym_break_flag=2),
+                RooneyBieglerMultiInputExperimentFlag(hour=4.0, sym_break_flag=2),
+            ],
+            objective_option="pseudo_trace",
+            step=1e-2,
+            solver=self._make_solver(),
+        )
+        with self.assertLogs("pyomo.contrib.doe.doe", level="WARNING") as cm:
+            doe_obj.optimize_experiments()
+        self.assertTrue(
+            any("Multiple variables marked in sym_break_cons" in msg for msg in cm.output)
+        )
 
 
 if __name__ == "__main__":
