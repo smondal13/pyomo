@@ -15,12 +15,20 @@ from pyomo.contrib.doe import DesignOfExperiments
 
 import pyomo.environ as pyo
 
+import inspect
 import json
 
 
 # Example for sensitivity analysis on the reactor experiment
 # After sensitivity analysis is done, we perform optimal DoE
-def run_reactor_doe():
+def run_reactor_doe(
+    n_points_for_design=9,
+    compute_FIM_full_factorial=True,
+    plot_factorial_results=True,
+    figure_file_name="example_reactor_compute_FIM",
+    log_scale=False,
+    run_optimal_doe=True,
+):
     # Read in file
     DATA_DIR = pathlib.Path(__file__).parent
     file_path = DATA_DIR / "result.json"
@@ -50,10 +58,7 @@ def run_reactor_doe():
     # We will not be passing any prior information in this example
     # and allow the experiment object and the DesignOfExperiments
     # call of ``run_doe`` perform model initialization.
-    doe_obj = DesignOfExperiments(
-        experiment,
-        gradient_method=gradient_method,
-        fd_formula=None,  # This argument has been deprecated in favor of gradient_method
+    doe_kwargs = dict(
         step=step_size,
         objective_option=objective_option,
         scale_constant_value=1,
@@ -62,53 +67,70 @@ def run_reactor_doe():
         jac_initial=None,
         fim_initial=None,
         L_diagonal_lower_bound=1e-7,
-        solver=pyo.SolverFactory(
-            'ipopt'
-        ),  # If none, use default in Pyomo.DoE (ipopt with ma57)
-        tee=True,
         get_labeled_model_args=None,
         _Cholesky_option=True,
         _only_compute_fim_lower=True,
     )
-
-    # Make design ranges to compute the full factorial design
-    design_ranges = {"CA[0]": [1, 5, 9], "T[0]": [300, 700, 9]}
-
-    # Compute the full factorial design with the sequential FIM calculation
-    doe_obj.compute_FIM_full_factorial(design_ranges=design_ranges)
-
-    # Plot the results
-    doe_obj.draw_factorial_figure(
-        sensitivity_design_variables=["CA[0]", "T[0]"],
-        fixed_design_variables={
-            "T[0.125]": 300,
-            "T[0.25]": 300,
-            "T[0.375]": 300,
-            "T[0.5]": 300,
-            "T[0.625]": 300,
-            "T[0.75]": 300,
-            "T[0.875]": 300,
-            "T[1]": 300,
-        },
-        title_text="Reactor Example",
-        xlabel_text="Concentration of A (M)",
-        ylabel_text="Initial Temperature (K)",
-        figure_file_name="example_reactor_compute_FIM",
-        log_scale=False,
+    supports_gradient_method = (
+        "gradient_method" in inspect.signature(DesignOfExperiments.__init__).parameters
     )
+    if supports_gradient_method:
+        # Prefer the newer API when available.
+        doe_kwargs["gradient_method"] = gradient_method
+        doe_kwargs["fd_formula"] = None
+        doe_kwargs["solver"] = pyo.SolverFactory('ipopt')
+        doe_kwargs["tee"] = True
+    else:
+        # Keep this example runnable against branches that still use fd_formula.
+        doe_kwargs["fd_formula"] = gradient_method
+        doe_kwargs["solver"] = None
+        doe_kwargs["tee"] = False
+
+    doe_obj = DesignOfExperiments(experiment, **doe_kwargs)
+
+    if compute_FIM_full_factorial:
+        # Make design ranges to compute the full factorial design
+        design_ranges = {
+            "CA[0]": [1, 5, n_points_for_design],
+            "T[0]": [300, 700, n_points_for_design],
+        }
+
+        # Compute the full factorial design with the sequential FIM calculation
+        doe_obj.compute_FIM_full_factorial(design_ranges=design_ranges)
+
+    if plot_factorial_results:
+        # Plot the results
+        doe_obj.draw_factorial_figure(
+            sensitivity_design_variables=["CA[0]", "T[0]"],
+            fixed_design_variables={
+                "T[0.125]": 300,
+                "T[0.25]": 300,
+                "T[0.375]": 300,
+                "T[0.5]": 300,
+                "T[0.625]": 300,
+                "T[0.75]": 300,
+                "T[0.875]": 300,
+                "T[1]": 300,
+            },
+            title_text="Reactor Example",
+            xlabel_text="Concentration of A (M)",
+            ylabel_text="Initial Temperature (K)",
+            figure_file_name=figure_file_name,
+            log_scale=log_scale,
+        )
 
     ###########################
     # End sensitivity analysis
 
     # Begin optimal DoE
     ####################
-    if gradient_method == "kaug":
+    if run_optimal_doe and gradient_method == "kaug":
         # Cannot run optimal DoE with kaug gradient method
         # This is because the kaug method only computes the FIM
         # at a specific design point, and does not support
         # mathematical optimization.
         pass
-    else:
+    elif run_optimal_doe:
         doe_obj.run_doe()
 
         # Print out a results summary
@@ -148,6 +170,7 @@ def run_reactor_doe():
 
     ###################
     # End optimal DoE
+    return doe_obj
 
 
 if __name__ == "__main__":
