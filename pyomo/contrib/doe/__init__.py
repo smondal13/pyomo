@@ -44,3 +44,12 @@ class DesignVariables:
 class ModelOptionLib:
     def __init__(self, *args):
         raise RuntimeError(deprecation_message)
+
+
+@deprecated(
+    "Use of FiniteDifferenceStep in Pyomo.DoE is no longer supported. Use GradientMethod instead.",
+    version='6.9.4',
+)
+class FiniteDifferenceStep:
+    def __init__(self, *args):
+        raise RuntimeError(deprecation_message)

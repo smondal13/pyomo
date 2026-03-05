@@ -1,11 +1,13 @@
-# ____________________________________________________________________________________
+#  ___________________________________________________________________________
 #
-# Pyomo: Python Optimization Modeling Objects
-# Copyright (c) 2008-2026 National Technology and Engineering Solutions of Sandia, LLC
-# Under the terms of Contract DE-NA0003525 with National Technology and Engineering
-# Solutions of Sandia, LLC, the U.S. Government retains certain rights in this
-# software.  This software is distributed under the 3-clause BSD License.
-# ____________________________________________________________________________________
+#  Pyomo: Python Optimization Modeling Objects
+#  Copyright (c) 2008-2025
+#  National Technology and Engineering Solutions of Sandia, LLC
+#  Under the terms of Contract DE-NA0003525 with National Technology and
+#  Engineering Solutions of Sandia, LLC, the U.S. Government retains certain
+#  rights in this software.
+#  This software is distributed under the 3-clause BSD License.
+#  ___________________________________________________________________________
 from pyomo.common.dependencies import numpy as np, pathlib
 
 from pyomo.contrib.doe.examples.reactor_experiment import ReactorExperiment
@@ -18,30 +20,7 @@ import json
 
 # Example for sensitivity analysis on the reactor experiment
 # After sensitivity analysis is done, we perform optimal DoE
-def run_reactor_doe(
-    n_points_for_design=9,
-    compute_FIM_full_factorial=True,
-    plot_factorial_results=True,
-    figure_file_name="example_reactor_compute_FIM",
-    log_scale=False,
-    run_optimal_doe=True,
-):
-    """
-    This function demonstrates how to perform sensitivity analysis on the reactor
-
-    Parameters
-    ----------
-    n_points_for_design : int, optional
-        number of points to use for the design ranges, by default 9
-    compute_FIM_full_factorial : bool, optional
-        whether to compute the full factorial design, by default True
-    plot_factorial_results : bool, optional
-        whether to plot the results of the full factorial design, by default True
-    figure_file_name : str, optional
-        file name to save the factorial figure, by default "example_reactor_compute_FIM"
-    run_optimal_doe : bool, optional
-        whether to run the optimal DoE, by default True
-    """
+def run_reactor_doe():
     # Read in file
     DATA_DIR = pathlib.Path(__file__).parent
     file_path = DATA_DIR / "result.json"
@@ -59,7 +38,8 @@ def run_reactor_doe(
     experiment = ReactorExperiment(data=data_ex, nfe=10, ncp=3)
 
     # Use a central difference, with step size 1e-3
-    fd_formula = "central"
+    # Other options are "forward", "backward", "kaug", and "pynumero".
+    gradient_method = "central"
     step_size = 1e-3
 
     # Use the determinant objective with scaled sensitivity matrix
@@ -72,7 +52,8 @@ def run_reactor_doe(
     # call of ``run_doe`` perform model initialization.
     doe_obj = DesignOfExperiments(
         experiment,
-        fd_formula=fd_formula,
+        gradient_method=gradient_method,
+        fd_formula=None,  # This argument has been deprecated in favor of gradient_method
         step=step_size,
         objective_option=objective_option,
         scale_constant_value=1,
@@ -81,50 +62,53 @@ def run_reactor_doe(
         jac_initial=None,
         fim_initial=None,
         L_diagonal_lower_bound=1e-7,
-        solver=None,
-        tee=False,
+        solver=pyo.SolverFactory(
+            'ipopt'
+        ),  # If none, use default in Pyomo.DoE (ipopt with ma57)
+        tee=True,
         get_labeled_model_args=None,
         _Cholesky_option=True,
         _only_compute_fim_lower=True,
     )
-    if compute_FIM_full_factorial:
-        # Make design ranges to compute the full factorial design
-        design_ranges = {
-            "CA[0]": [1, 5, n_points_for_design],
-            "T[0]": [300, 700, n_points_for_design],
-        }
 
-        # Compute the full factorial design with the sequential FIM calculation
-        doe_obj.compute_FIM_full_factorial(
-            design_ranges=design_ranges, method="sequential"
-        )
-    if plot_factorial_results:
-        # Plot the results
-        doe_obj.draw_factorial_figure(
-            sensitivity_design_variables=["CA[0]", "T[0]"],
-            fixed_design_variables={
-                "T[0.125]": 300,
-                "T[0.25]": 300,
-                "T[0.375]": 300,
-                "T[0.5]": 300,
-                "T[0.625]": 300,
-                "T[0.75]": 300,
-                "T[0.875]": 300,
-                "T[1]": 300,
-            },
-            title_text="Reactor Example",
-            xlabel_text="Concentration of A (M)",
-            ylabel_text="Initial Temperature (K)",
-            figure_file_name=figure_file_name,
-            log_scale=log_scale,
-        )
+    # Make design ranges to compute the full factorial design
+    design_ranges = {"CA[0]": [1, 5, 9], "T[0]": [300, 700, 9]}
+
+    # Compute the full factorial design with the sequential FIM calculation
+    doe_obj.compute_FIM_full_factorial(design_ranges=design_ranges)
+
+    # Plot the results
+    doe_obj.draw_factorial_figure(
+        sensitivity_design_variables=["CA[0]", "T[0]"],
+        fixed_design_variables={
+            "T[0.125]": 300,
+            "T[0.25]": 300,
+            "T[0.375]": 300,
+            "T[0.5]": 300,
+            "T[0.625]": 300,
+            "T[0.75]": 300,
+            "T[0.875]": 300,
+            "T[1]": 300,
+        },
+        title_text="Reactor Example",
+        xlabel_text="Concentration of A (M)",
+        ylabel_text="Initial Temperature (K)",
+        figure_file_name="example_reactor_compute_FIM",
+        log_scale=False,
+    )
 
     ###########################
     # End sensitivity analysis
 
     # Begin optimal DoE
     ####################
-    if run_optimal_doe:
+    if gradient_method == "kaug":
+        # Cannot run optimal DoE with kaug gradient method
+        # This is because the kaug method only computes the FIM
+        # at a specific design point, and does not support
+        # mathematical optimization.
+        pass
+    else:
         doe_obj.run_doe()
 
         # Print out a results summary
@@ -146,12 +130,24 @@ def run_reactor_doe(
             )
         )
 
-        print(doe_obj.results["Experiment Design Names"])
+        # This code demonstrates how to access the DoE results,
+        # store in a Pandas DataFrame, and print it out in a readable format.
+        import pandas as pd
 
-        ###################
-        # End optimal DoE
+        print("\n***Optimal Experiment Design***")
 
-    return doe_obj
+        design_names = doe_obj.results["Experiment Design Names"]
+        design_values = doe_obj.results["Experiment Design"]
+        df = pd.DataFrame(
+            {
+                "Decision Var": design_names,
+                "Value": [round(val, 2) for val in design_values],
+            }
+        )
+        print(df)
+
+    ###################
+    # End optimal DoE
 
 
 if __name__ == "__main__":
