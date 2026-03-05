@@ -64,6 +64,12 @@ class PolynomialExperiment(Experiment):
         m.c = pyo.Var(bounds=(-5, 5), initialize=0.5)
         m.d = pyo.Var(bounds=(-5, 5), initialize=-1)
 
+        # Unknown parameters are fixed at nominal values for local sensitivities.
+        m.a.fix()
+        m.b.fix()
+        m.c.fix()
+        m.d.fix()
+
         # Model output (dependent variable)
         m.y = pyo.Var(initialize=0)
 
@@ -122,7 +128,7 @@ def run_polynomial_doe():
     # and allow the experiment object and the DesignOfExperiments
     # call of ``run_doe`` perform model initialization.
     doe_obj = DesignOfExperiments(
-        experiment,
+        experiment_list=[experiment],
         gradient_method="pynumero",  # Use Pynumero symbolic gradient
         fd_formula=None,
         step=1e-3,

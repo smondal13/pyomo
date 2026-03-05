@@ -49,8 +49,11 @@ from pyomo.common.dependencies import (
     scipy_available,
 )
 
+from pyomo.common.collections import ComponentSet
 from pyomo.common.errors import DeveloperError
 from pyomo.common.timing import TicTocTimer
+from pyomo.core.expr.calculus.diff_with_pyomo import reverse_ad
+from pyomo.core.expr.visitor import identify_variables
 
 from pyomo.contrib.sensitivity_toolbox.sens import get_dsdp
 
@@ -2295,11 +2298,7 @@ class DesignOfExperiments:
             elif self._gradient_method == GradientMethod.kaug:
                 method = "kaug"
             elif self._gradient_method == GradientMethod.pynumero:
-                raise NotImplementedError(
-                    "gradient_method='pynumero' is not yet fully integrated in "
-                    "this branch. Please use a finite-difference method or "
-                    "gradient_method='kaug'."
-                )
+                method = "pynumero"
             else:
                 raise DeveloperError(
                     "Gradient method option not recognized. Please contact the "
@@ -2317,11 +2316,14 @@ class DesignOfExperiments:
         elif method == "kaug":
             self._kaug_FIM(model=model)
             self._computed_FIM = self.kaug_FIM
+        elif method in ["pynumero", "symbolic"]:
+            self._pynumero_FIM(model=model)
+            self._computed_FIM = self.pynumero_FIM
         else:
             raise ValueError(
                 (
-                    "The method provided, {}, must be either `sequential` "
-                    "or `kaug`".format(method)
+                    "The method provided, {}, must be one of `sequential`, "
+                    "`kaug`, or `pynumero`".format(method)
                 )
             )
 
@@ -2588,6 +2590,133 @@ class DesignOfExperiments:
         # Still deciding where this would be best.
 
         self.kaug_FIM = self.kaug_jac.T @ cov_y @ self.kaug_jac + self.prior_FIM
+
+    def _compute_symbolic_sensitivity_matrix(self, model):
+        """
+        Compute d(outputs)/d(parameters) via implicit differentiation of
+        active equality constraints at the current model point.
+        """
+        con_set = ComponentSet()
+        var_set = ComponentSet()
+        param_set = ComponentSet()
+
+        for p in model.unknown_parameters.keys():
+            param_set.add(p)
+
+        for c in model.component_data_objects(
+            pyo.Constraint, descend_into=True, active=True
+        ):
+            if not c.equality:
+                continue
+            con_set.add(c)
+            for v in identify_variables(c.body, include_fixed=False):
+                var_set.add(v)
+
+        # Unknown parameters are often fixed variables and can be omitted by
+        # identify_variables(..., include_fixed=False). Add them explicitly.
+        for p in param_set:
+            var_set.add(p)
+
+        con_list = list(con_set)
+        param_list = list(param_set)
+        state_vars = [v for v in var_set if v not in param_set]
+
+        if len(con_list) != len(state_vars):
+            raise ValueError(
+                "For gradient_method='pynumero', the model must satisfy a square "
+                "implicit system: number of active equality constraints must equal "
+                "number of state variables (excluding unknown parameters). "
+                f"Got {len(con_list)} constraints and {len(state_vars)} state vars."
+            )
+
+        jac_con_wrt_state = np.zeros((len(con_list), len(state_vars)))
+        jac_con_wrt_param = np.zeros((len(con_list), len(param_list)))
+
+        for i, c in enumerate(con_list):
+            der_map = reverse_ad(c.body)
+            for j, v in enumerate(state_vars):
+                jac_con_wrt_state[i, j] = der_map.get(v, 0.0)
+            for j, p in enumerate(param_list):
+                jac_con_wrt_param[i, j] = der_map.get(p, 0.0)
+
+        try:
+            jac_state_wrt_param = np.linalg.solve(
+                jac_con_wrt_state, -jac_con_wrt_param
+            )
+        except np.linalg.LinAlgError as err:
+            raise RuntimeError(
+                "Failed to compute symbolic sensitivities because the Jacobian of "
+                "active equality constraints with respect to state variables is "
+                "singular or ill-conditioned."
+            ) from err
+
+        state_index = {id(v): i for i, v in enumerate(state_vars)}
+        param_index = {id(p): j for j, p in enumerate(param_list)}
+        jac = np.zeros((len(model.experiment_outputs), len(param_list)))
+
+        for i, y in enumerate(model.experiment_outputs.keys()):
+            sidx = state_index.get(id(y))
+            if sidx is not None:
+                jac[i, :] = jac_state_wrt_param[sidx, :]
+                continue
+
+            # Outputs that map directly to unknown parameters carry identity
+            # sensitivities; otherwise they are insensitive at this level.
+            pidx = param_index.get(id(y))
+            if pidx is not None:
+                jac[i, pidx] = 1.0
+            else:
+                jac[i, :] = 0.0
+
+        for j, p in enumerate(param_list):
+            scale = self.scale_constant_value
+            if self.scale_nominal_param_value:
+                scale *= pyo.value(model.unknown_parameters[p])
+            jac[:, j] *= scale
+
+        return jac, param_list
+
+    def _pynumero_FIM(self, model=None):
+        """
+        Compute FIM using symbolic/automatic differentiation of model equations.
+        """
+        if model is None:
+            self.compute_FIM_model = (
+                self.experiment_list[0]
+                .get_labeled_model(**self.get_labeled_model_args)
+                .clone()
+            )
+            model = self.compute_FIM_model
+
+        if not hasattr(model, "objective"):
+            model.objective = pyo.Objective(expr=0, sense=pyo.minimize)
+
+        for comp in model.experiment_inputs:
+            comp.fix()
+
+        try:
+            res = self.solver.solve(model, tee=self.tee)
+            pyo.assert_optimal_termination(res)
+        except:
+            raise RuntimeError(
+                "Model from experiment did not solve appropriately. "
+                "Make sure the model is well-posed."
+            )
+
+        self.pynumero_jac, param_list = self._compute_symbolic_sensitivity_matrix(model)
+
+        if self.prior_FIM is None:
+            self.prior_FIM = np.zeros((len(param_list), len(param_list)))
+        else:
+            self.check_model_FIM(FIM=self.prior_FIM)
+
+        cov_y = np.zeros((len(model.measurement_error), len(model.measurement_error)))
+        for i, (_, v) in enumerate(model.measurement_error.items()):
+            cov_y[i, i] = 1 / v**2
+
+        self.pynumero_FIM = (
+            self.pynumero_jac.T @ cov_y @ self.pynumero_jac + self.prior_FIM
+        )
 
     # Create the DoE model (with ``scenarios`` from finite differencing scheme)
     def create_doe_model(

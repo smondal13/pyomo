@@ -37,6 +37,7 @@ if not (numpy_available and scipy_available):
 
 if scipy_available:
     from pyomo.contrib.doe import DesignOfExperiments
+    from pyomo.contrib.doe.examples.polynomial import PolynomialExperiment
     from pyomo.contrib.doe.examples.reactor_experiment import ReactorExperiment
     from pyomo.contrib.doe.examples.reactor_example import (
         ReactorExperiment as FullReactorExperiment,
@@ -592,6 +593,59 @@ class TestRooneyBieglerExampleSolving(unittest.TestCase):
 
         # assert unique values are correct
         self.assertTrue(set(hour_vals).issuperset(set([1, 5])))
+
+
+@unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+@unittest.skipIf(not numpy_available, "Numpy is not available")
+@unittest.skipIf(not scipy_available, "scipy is not available")
+class TestPynumeroFIM(unittest.TestCase):
+    def _make_solver(self):
+        return SolverFactory("ipopt")
+
+    def test_pynumero_compute_fim_matches_polynomial_analytic(self):
+        experiment = PolynomialExperiment(data=None)
+        doe_obj = DesignOfExperiments(
+            experiment_list=[experiment],
+            gradient_method="pynumero",
+            objective_option="determinant",
+            scale_constant_value=1.0,
+            scale_nominal_param_value=False,
+            solver=self._make_solver(),
+            tee=False,
+        )
+
+        fim = doe_obj.compute_FIM()
+        expected_fim = np.ones((4, 4))
+
+        self.assertTrue(np.all(np.isclose(fim, expected_fim, atol=1e-8)))
+
+    def test_pynumero_compute_fim_matches_central_difference(self):
+        experiment_sym = PolynomialExperiment(data=None)
+        sym_obj = DesignOfExperiments(
+            experiment_list=[experiment_sym],
+            gradient_method="pynumero",
+            objective_option="determinant",
+            scale_constant_value=1.0,
+            scale_nominal_param_value=False,
+            solver=self._make_solver(),
+            tee=False,
+        )
+        fim_sym = sym_obj.compute_FIM()
+
+        experiment_fd = PolynomialExperiment(data=None)
+        fd_obj = DesignOfExperiments(
+            experiment_list=[experiment_fd],
+            fd_formula="central",
+            step=1e-6,
+            objective_option="determinant",
+            scale_constant_value=1.0,
+            scale_nominal_param_value=False,
+            solver=self._make_solver(),
+            tee=False,
+        )
+        fim_fd = fd_obj.compute_FIM(method="sequential")
+
+        self.assertTrue(np.all(np.isclose(fim_sym, fim_fd, atol=1e-6, rtol=1e-6)))
 
 
 @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")

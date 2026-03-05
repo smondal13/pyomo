@@ -821,7 +821,7 @@ class TestDoEErrors(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            "The method provided, {}, must be either `sequential` or `kaug`".format(
+            "The method provided, {}, must be one of `sequential`, `kaug`, or `pynumero`".format(
                 "Bad Method"
             ),
         ):
