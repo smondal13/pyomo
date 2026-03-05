@@ -602,8 +602,14 @@ class TestPynumeroFIM(unittest.TestCase):
     def _make_solver(self):
         return SolverFactory("ipopt")
 
+    def _set_polynomial_design(self, experiment, x1=2.0, x2=3.0):
+        model = experiment.get_labeled_model()
+        model.x1.set_value(x1)
+        model.x2.set_value(x2)
+
     def test_pynumero_compute_fim_matches_polynomial_analytic(self):
         experiment = PolynomialExperiment(data=None)
+        self._set_polynomial_design(experiment, x1=2.0, x2=3.0)
         doe_obj = DesignOfExperiments(
             experiment_list=[experiment],
             gradient_method="pynumero",
@@ -615,12 +621,16 @@ class TestPynumeroFIM(unittest.TestCase):
         )
 
         fim = doe_obj.compute_FIM()
-        expected_fim = np.ones((4, 4))
+        expected_jac = np.array([[2.0, 3.0, 6.0, 1.0]])
+        expected_fim = expected_jac.T @ expected_jac
 
         self.assertTrue(np.all(np.isclose(fim, expected_fim, atol=1e-8)))
+        self.assertAlmostEqual(fim[2, 2], 36.0, places=10)
+        self.assertAlmostEqual(doe_obj.pynumero_jac[0, 2], 6.0, places=10)
 
     def test_pynumero_compute_fim_matches_central_difference(self):
         experiment_sym = PolynomialExperiment(data=None)
+        self._set_polynomial_design(experiment_sym, x1=2.0, x2=3.0)
         sym_obj = DesignOfExperiments(
             experiment_list=[experiment_sym],
             gradient_method="pynumero",
@@ -633,6 +643,7 @@ class TestPynumeroFIM(unittest.TestCase):
         fim_sym = sym_obj.compute_FIM()
 
         experiment_fd = PolynomialExperiment(data=None)
+        self._set_polynomial_design(experiment_fd, x1=2.0, x2=3.0)
         fd_obj = DesignOfExperiments(
             experiment_list=[experiment_fd],
             fd_formula="central",
