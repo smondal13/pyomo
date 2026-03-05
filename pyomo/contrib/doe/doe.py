@@ -52,7 +52,7 @@ from pyomo.common.dependencies import (
 from pyomo.common.collections import ComponentSet
 from pyomo.common.errors import DeveloperError
 from pyomo.common.timing import TicTocTimer
-from pyomo.core.expr.calculus.diff_with_pyomo import reverse_ad
+from pyomo.core.expr.calculus.diff_with_pyomo import reverse_ad, reverse_sd
 from pyomo.core.expr.visitor import identify_variables
 
 from pyomo.contrib.sensitivity_toolbox.sens import get_dsdp
@@ -796,10 +796,10 @@ class DesignOfExperiments:
             configured on the main DoE solver are propagated to candidate FIM
             evaluations.
         """
-        if self._gradient_method not in self._FINITE_DIFFERENCE_GRADIENTS:
+        if self._gradient_method == GradientMethod.kaug:
             raise NotImplementedError(
-                "optimize_experiments currently supports only finite-difference "
-                "gradient methods ('forward', 'central', 'backward'). "
+                "optimize_experiments currently supports finite-difference and "
+                "pynumero gradient methods. "
                 f"Received gradient_method='{self._enum_label(self._gradient_method)}'."
             )
 
@@ -1709,8 +1709,8 @@ class DesignOfExperiments:
     def _compute_fim_at_point_no_prior(self, experiment_index, input_values):
         """
         Compute the FIM (without the prior FIM contribution) for the given
-        experiment at the specified experiment-input values using the
-        sequential finite-difference method.
+        experiment at the specified experiment-input values using the current
+        gradient method.
 
         Parameters
         ----------
@@ -1745,8 +1745,20 @@ class DesignOfExperiments:
         self.prior_FIM = np.zeros((n_params, n_params))
 
         try:
-            self._sequential_FIM(model=model)
-            fim = self.seq_FIM.copy()
+            if self._gradient_method in self._FINITE_DIFFERENCE_GRADIENTS:
+                self._sequential_FIM(model=model)
+                fim = self.seq_FIM.copy()
+            elif self._gradient_method == GradientMethod.pynumero:
+                self._pynumero_FIM(model=model)
+                fim = self.pynumero_FIM.copy()
+            elif self._gradient_method == GradientMethod.kaug:
+                self._kaug_FIM(model=model)
+                fim = self.kaug_FIM.copy()
+            else:
+                raise DeveloperError(
+                    "Gradient method option not recognized. Please contact the "
+                    "developers as you should not see this error."
+                )
         except Exception as exc:
             self.logger.warning(
                 f"FIM evaluation failed at point {input_values}: {exc}. "
@@ -1896,9 +1908,8 @@ class DesignOfExperiments:
                     # previous point failed; transient failures should not disable
                     # the rest of this thread's candidate evaluations.
                     worker_solver = _make_worker_solver()
-                    worker_doe = DesignOfExperiments(
+                    worker_kwargs = dict(
                         experiment_list=self.experiment_list,
-                        fd_formula=self.fd_formula.value,
                         step=self.step,
                         objective_option=self.objective_option.value,
                         use_grey_box_objective=self.use_grey_box,
@@ -1918,6 +1929,11 @@ class DesignOfExperiments:
                         _Cholesky_option=self.Cholesky_option,
                         _only_compute_fim_lower=self.only_compute_fim_lower,
                     )
+                    if self._gradient_method is not None:
+                        worker_kwargs["gradient_method"] = self._gradient_method.value
+                    if self.fd_formula is not None:
+                        worker_kwargs["fd_formula"] = self.fd_formula.value
+                    worker_doe = DesignOfExperiments(**worker_kwargs)
                     thread_state.doe = worker_doe
                 # LHS initialization evaluates candidate points against the
                 # canonical experiment template (experiment_list[0]).
@@ -2740,10 +2756,12 @@ class DesignOfExperiments:
                                variables that will be created at the aggregated level (default: False)
 
         """
-        if self._gradient_method not in self._FINITE_DIFFERENCE_GRADIENTS:
+        if self._gradient_method not in self._FINITE_DIFFERENCE_GRADIENTS.union(
+            {GradientMethod.pynumero}
+        ):
             raise NotImplementedError(
-                "create_doe_model currently supports only finite-difference "
-                "gradient methods ('forward', 'central', 'backward'). "
+                "create_doe_model currently supports finite-difference and "
+                "pynumero gradient methods. "
                 f"Received gradient_method='{self._enum_label(self._gradient_method)}'."
             )
 
@@ -2771,10 +2789,15 @@ class DesignOfExperiments:
                 "if only_compute_fim_lower is True."
             )
 
-        # Generate scenarios for finite difference formulae
-        self._generate_fd_scenario_blocks(
-            model=model, experiment_index=experiment_index
-        )
+        # Generate scenarios needed for the selected gradient method.
+        if self._gradient_method in self._FINITE_DIFFERENCE_GRADIENTS:
+            self._generate_fd_scenario_blocks(
+                model=model, experiment_index=experiment_index
+            )
+        else:
+            self._generate_pynumero_scenario_blocks(
+                model=model, experiment_index=experiment_index
+            )
 
         # Set names for indexing sensitivity matrix (jacobian) and FIM
         scen_block_ind = min(
@@ -2906,52 +2929,191 @@ class DesignOfExperiments:
                             if self.objective_option == ObjectiveLib.trace:
                                 model.L_inv[c, d].setlb(self.L_diagonal_lower_bound)
 
-        # jacobian rule
-        def jacobian_rule(m, n, p):
-            """
-            m: Pyomo model
-            n: experimental output
-            p: unknown parameter
-            """
-            fd_step_mult = 1
-            cuid = pyo.ComponentUID(n)
-            param_ind = m.parameter_names.data().index(p)
+        if self._gradient_method == GradientMethod.pynumero:
+            base_block = model.fd_scenario_blocks[0]
+            parameter_names_list = list(model.parameter_names)
+            output_names_list = list(model.output_names)
 
-            # Different FD schemes lead to different scenarios for the computation
-            if self.fd_formula == FiniteDifferenceStep.central:
-                s1 = param_ind * 2
-                s2 = param_ind * 2 + 1
-                fd_step_mult = 2
-            elif self.fd_formula == FiniteDifferenceStep.forward:
-                s1 = param_ind + 1
-                s2 = 0
-            elif self.fd_formula == FiniteDifferenceStep.backward:
-                s1 = 0
-                s2 = param_ind + 1
+            param_var_by_name = {
+                name: var
+                for name, var in zip(
+                    parameter_names_list, base_block.unknown_parameters.keys()
+                )
+            }
+            output_var_by_name = {
+                name: var
+                for name, var in zip(output_names_list, base_block.experiment_outputs.keys())
+            }
 
-            var_up = cuid.find_component_on(m.fd_scenario_blocks[s1])
-            var_lo = cuid.find_component_on(m.fd_scenario_blocks[s2])
+            input_var_set = ComponentSet(base_block.experiment_inputs.keys())
+            param_var_set = ComponentSet(param_var_by_name.values())
+            con_list = []
+            state_var_set = ComponentSet()
 
-            param = m.parameter_scenarios[max(s1, s2)]
-            param_loc = pyo.ComponentUID(param).find_component_on(
-                m.fd_scenario_blocks[0]
+            for con in base_block.component_data_objects(
+                pyo.Constraint, descend_into=True, active=True
+            ):
+                if not con.equality:
+                    continue
+                con_list.append(con)
+                for var in identify_variables(con.body, include_fixed=False):
+                    if var in input_var_set or var in param_var_set:
+                        continue
+                    state_var_set.add(var)
+
+            state_var_list = list(state_var_set)
+            if len(con_list) != len(state_var_list):
+                raise ValueError(
+                    "For gradient_method='pynumero', the model must satisfy a square "
+                    "implicit system per experiment: number of active equality "
+                    "constraints must equal number of state variables "
+                    "(excluding unknown parameters and experiment inputs). "
+                    f"Got {len(con_list)} constraints and {len(state_var_list)} "
+                    "state variables."
+                )
+
+            con_names = [str(pyo.ComponentUID(c, context=base_block)) for c in con_list]
+            state_names = [
+                str(pyo.ComponentUID(v, context=base_block)) for v in state_var_list
+            ]
+            con_by_name = {name: con for name, con in zip(con_names, con_list)}
+            state_var_by_name = {
+                name: var for name, var in zip(state_names, state_var_list)
+            }
+            state_name_by_var_id = {id(v): n for n, v in state_var_by_name.items()}
+            param_name_by_var_id = {id(v): n for n, v in param_var_by_name.items()}
+
+            dcdx_expr = {}
+            dcdp_expr = {}
+            jac_con_wrt_state = np.zeros((len(con_list), len(state_var_list)))
+            jac_con_wrt_param = np.zeros((len(con_list), len(parameter_names_list)))
+
+            for ci, c_name in enumerate(con_names):
+                con = con_by_name[c_name]
+                deriv_expr_map = reverse_sd(con.body)
+                deriv_num_map = reverse_ad(con.body)
+                for xi, x_name in enumerate(state_names):
+                    x_var = state_var_by_name[x_name]
+                    dcdx_expr[(c_name, x_name)] = deriv_expr_map.get(x_var, 0.0)
+                    jac_con_wrt_state[ci, xi] = deriv_num_map.get(x_var, 0.0)
+                for pj, p_name in enumerate(parameter_names_list):
+                    p_var = param_var_by_name[p_name]
+                    dcdp_expr[(c_name, p_name)] = deriv_expr_map.get(p_var, 0.0)
+                    jac_con_wrt_param[ci, pj] = deriv_num_map.get(p_var, 0.0)
+
+            init_state_sens_values = {
+                (x_name, p_name): 0.0
+                for x_name in state_names
+                for p_name in parameter_names_list
+            }
+            if con_names:
+                try:
+                    init_state_sens = np.linalg.solve(
+                        jac_con_wrt_state, -jac_con_wrt_param
+                    )
+                    for xi, x_name in enumerate(state_names):
+                        for pj, p_name in enumerate(parameter_names_list):
+                            init_state_sens_values[(x_name, p_name)] = init_state_sens[
+                                xi, pj
+                            ]
+                except np.linalg.LinAlgError:
+                    # Keep zero initialization; IPOPT can still refine sensitivities.
+                    pass
+
+            model.pynumero_constraint_names = pyo.Set(initialize=con_names)
+            model.pynumero_state_var_names = pyo.Set(initialize=state_names)
+
+            def _init_state_parameter_sens(m, x_name, p_name):
+                return init_state_sens_values[(x_name, p_name)]
+
+            model.state_parameter_sens = pyo.Var(
+                model.pynumero_state_var_names,
+                model.parameter_names,
+                initialize=_init_state_parameter_sens,
             )
-            param_val = m.fd_scenario_blocks[0].unknown_parameters[param_loc]
-            param_diff = param_val * fd_step_mult * self.step
 
-            if self.scale_nominal_param_value:
-                return (
-                    m.sensitivity_jacobian[n, p]
-                    == (var_up - var_lo)
-                    / param_diff
-                    * param_val
-                    * self.scale_constant_value
+            def implicit_sensitivity_rule(m, c_name, p_name):
+                return sum(
+                    dcdx_expr[(c_name, x_name)] * m.state_parameter_sens[x_name, p_name]
+                    for x_name in m.pynumero_state_var_names
+                ) == -dcdp_expr[(c_name, p_name)]
+
+            model.pynumero_implicit_sensitivity_constraint = pyo.Constraint(
+                model.pynumero_constraint_names,
+                model.parameter_names,
+                rule=implicit_sensitivity_rule,
+            )
+
+            # jacobian rule
+            def jacobian_rule(m, n, p):
+                out_var = output_var_by_name[n]
+
+                scale = self.scale_constant_value
+                if self.scale_nominal_param_value:
+                    scale *= param_var_by_name[p]
+
+                out_state_name = state_name_by_var_id.get(id(out_var))
+                if out_state_name is not None:
+                    return (
+                        m.sensitivity_jacobian[n, p]
+                        == m.state_parameter_sens[out_state_name, p] * scale
+                    )
+
+                out_param_name = param_name_by_var_id.get(id(out_var))
+                if out_param_name is not None:
+                    return m.sensitivity_jacobian[n, p] == (
+                        (1.0 if out_param_name == p else 0.0) * scale
+                    )
+
+                return m.sensitivity_jacobian[n, p] == 0.0
+
+        else:
+            # jacobian rule
+            def jacobian_rule(m, n, p):
+                """
+                m: Pyomo model
+                n: experimental output
+                p: unknown parameter
+                """
+                fd_step_mult = 1
+                cuid = pyo.ComponentUID(n)
+                param_ind = m.parameter_names.data().index(p)
+
+                # Different FD schemes lead to different scenarios for the computation
+                if self.fd_formula == FiniteDifferenceStep.central:
+                    s1 = param_ind * 2
+                    s2 = param_ind * 2 + 1
+                    fd_step_mult = 2
+                elif self.fd_formula == FiniteDifferenceStep.forward:
+                    s1 = param_ind + 1
+                    s2 = 0
+                elif self.fd_formula == FiniteDifferenceStep.backward:
+                    s1 = 0
+                    s2 = param_ind + 1
+
+                var_up = cuid.find_component_on(m.fd_scenario_blocks[s1])
+                var_lo = cuid.find_component_on(m.fd_scenario_blocks[s2])
+
+                param = m.parameter_scenarios[max(s1, s2)]
+                param_loc = pyo.ComponentUID(param).find_component_on(
+                    m.fd_scenario_blocks[0]
                 )
-            else:
-                return (
-                    m.sensitivity_jacobian[n, p]
-                    == (var_up - var_lo) / param_diff * self.scale_constant_value
-                )
+                param_val = m.fd_scenario_blocks[0].unknown_parameters[param_loc]
+                param_diff = param_val * fd_step_mult * self.step
+
+                if self.scale_nominal_param_value:
+                    return (
+                        m.sensitivity_jacobian[n, p]
+                        == (var_up - var_lo)
+                        / param_diff
+                        * param_val
+                        * self.scale_constant_value
+                    )
+                else:
+                    return (
+                        m.sensitivity_jacobian[n, p]
+                        == (var_up - var_lo) / param_diff * self.scale_constant_value
+                    )
 
         # A constraint to calculate elements in Hessian matrix
         # transfer prior FIM to be Expressions
@@ -3227,6 +3389,79 @@ class DesignOfExperiments:
         model.del_component(model.base_model)
 
         # TODO: consider this logic? Multi-block systems need something more fancy
+        self._built_scenarios = True
+
+    def _generate_pynumero_scenario_blocks(self, model=None, experiment_index=0):
+        """
+        Generate a single scenario block for symbolic (pynumero) sensitivity
+        computations. This mirrors the finite-difference data layout so downstream
+        optimize_experiments logic can reuse the same model-access patterns.
+        """
+        if model is None:
+            model = self.model
+
+        model.base_model = (
+            self.experiment_list[experiment_index]
+            .get_labeled_model(**self.get_labeled_model_args)
+            .clone()
+        )
+
+        self.check_model_labels(model=model.base_model)
+
+        self.n_parameters = len(model.base_model.unknown_parameters)
+        self.n_measurement_error = len(model.base_model.measurement_error)
+        self.n_experiment_inputs = len(model.base_model.experiment_inputs)
+        self.n_experiment_outputs = len(model.base_model.experiment_outputs)
+
+        if self.n_measurement_error != self.n_experiment_outputs:
+            raise ValueError(
+                "Number of experiment outputs, {}, and length of measurement error, "
+                "{}, do not match. Please check model labeling.".format(
+                    self.n_experiment_outputs, self.n_measurement_error
+                )
+            )
+
+        self.logger.info("Experiment output and measurement error lengths match.")
+
+        if self.prior_FIM is not None:
+            self.check_model_FIM(FIM=self.prior_FIM)
+        else:
+            self.prior_FIM = np.zeros((self.n_parameters, self.n_parameters))
+        if self.fim_initial is not None:
+            self.check_model_FIM(FIM=self.fim_initial)
+        else:
+            self.fim_initial = np.eye(self.n_parameters) + self.prior_FIM
+        if self.jac_initial is not None:
+            self.check_model_jac(self.jac_initial)
+        else:
+            self.jac_initial = np.eye(self.n_experiment_outputs, self.n_parameters)
+
+        # Solve once with fixed experiment inputs to initialize consistent state.
+        for comp in model.base_model.experiment_inputs:
+            comp.fix()
+        try:
+            res = self.solver.solve(model.base_model, tee=self.tee)
+            pyo.assert_optimal_termination(res)
+            self.logger.info("Model from experiment solved.")
+        except:
+            raise RuntimeError(
+                "Model from experiment did not solve appropriately. "
+                "Make sure the model is well-posed."
+            )
+        for comp in model.base_model.experiment_inputs:
+            comp.unfix()
+
+        model.scenarios = range(1)
+
+        def build_block_scenarios(b, s):
+            parent_block = b.parent_block()
+            b.transfer_attributes_from(parent_block.base_model.clone())
+
+        model.fd_scenario_blocks = pyo.Block(
+            model.scenarios, rule=build_block_scenarios
+        )
+
+        model.del_component(model.base_model)
         self._built_scenarios = True
 
     # Create objective function

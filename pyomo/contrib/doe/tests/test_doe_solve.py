@@ -1049,6 +1049,27 @@ class TestOptimizeExperimentsAlgorithm(unittest.TestCase):
                 _for_multi_experiment=True,
             )
 
+    def test_optimize_experiments_pynumero_runs(self):
+        exp = RooneyBieglerMultiExperiment(hour=2.0, y=10.0)
+        solver = SolverFactory("ipopt")
+        solver.options["linear_solver"] = "ma57"
+        solver.options["halt_on_ampl_error"] = "yes"
+        solver.options["max_iter"] = 3000
+
+        doe = DesignOfExperiments(
+            experiment_list=[exp],
+            objective_option="pseudo_trace",
+            step=1e-2,
+            solver=solver,
+            gradient_method="pynumero",
+        )
+
+        doe.optimize_experiments(n_exp=2, init_method=None)
+
+        self.assertEqual(doe.results["Solver Status"], "ok")
+        self.assertEqual(doe.results["Gradient Method"], "pynumero")
+        self.assertEqual(doe.results["Number of Experiments per Scenario"], 2)
+
     def test_evaluate_objective_from_fim_numerical_values(self):
         fim = np.array([[4.0, 1.0], [1.0, 3.0]])
         expected_det = 11.0

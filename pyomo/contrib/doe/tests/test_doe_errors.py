@@ -147,17 +147,17 @@ class TestDoEErrors(unittest.TestCase):
         self.assertEqual(doe_obj._gradient_method, GradientMethod.forward)
         self.assertEqual(doe_obj.fd_formula.value, "forward")
 
-    def test_create_doe_model_pynumero_not_yet_supported(self):
+    def test_optimize_experiments_kaug_not_yet_supported(self):
         doe_obj = DesignOfExperiments(
             experiment_list=[_DummyExperiment()],
-            gradient_method="pynumero",
+            gradient_method="kaug",
             objective_option="pseudo_trace",
         )
         with self.assertRaisesRegex(
             NotImplementedError,
-            "create_doe_model currently supports only finite-difference",
+            "optimize_experiments currently supports finite-difference and pynumero",
         ):
-            doe_obj.create_doe_model()
+            doe_obj.optimize_experiments(n_exp=1)
 
     def test_doe_results_json_encoder_unsupported_object_raises(self):
         with self.assertRaises(TypeError):
