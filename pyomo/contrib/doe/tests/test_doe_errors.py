@@ -24,7 +24,11 @@ if not (numpy_available and scipy_available):
     raise unittest.SkipTest("Pyomo.DoE needs scipy and numpy to run tests")
 
 from pyomo.contrib.doe import DesignOfExperiments
-from pyomo.contrib.doe.doe import InitializationMethod, _DoEResultsJSONEncoder
+from pyomo.contrib.doe.doe import (
+    GradientMethod,
+    InitializationMethod,
+    _DoEResultsJSONEncoder,
+)
 from pyomo.contrib.doe.tests.experiment_class_example_flags import (
     BadExperiment,
     RooneyBieglerExperimentFlag,
@@ -133,6 +137,27 @@ class TestDoEErrors(unittest.TestCase):
             ValueError, "The 'experiment_list' cannot be empty"
         ):
             DesignOfExperiments(experiment_list=[], objective_option="pseudo_trace")
+
+    def test_gradient_method_forward_aliases_fd_formula(self):
+        doe_obj = DesignOfExperiments(
+            experiment_list=[_DummyExperiment()],
+            gradient_method="forward",
+            objective_option="pseudo_trace",
+        )
+        self.assertEqual(doe_obj._gradient_method, GradientMethod.forward)
+        self.assertEqual(doe_obj.fd_formula.value, "forward")
+
+    def test_create_doe_model_pynumero_not_yet_supported(self):
+        doe_obj = DesignOfExperiments(
+            experiment_list=[_DummyExperiment()],
+            gradient_method="pynumero",
+            objective_option="pseudo_trace",
+        )
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "create_doe_model currently supports only finite-difference",
+        ):
+            doe_obj.create_doe_model()
 
     def test_doe_results_json_encoder_unsupported_object_raises(self):
         with self.assertRaises(TypeError):

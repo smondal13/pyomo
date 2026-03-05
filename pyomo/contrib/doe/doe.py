@@ -86,6 +86,14 @@ class FiniteDifferenceStep(Enum):
     backward = "backward"
 
 
+class GradientMethod(Enum):
+    forward = "forward"  # finite difference forward method
+    central = "central"  # finite difference central method
+    backward = "backward"  # finite difference backward method
+    pynumero = "pynumero"  # automatic/symbolic differentiation using PyNumero
+    kaug = "kaug"  # automatic differentiation using k_aug
+
+
 class InitializationMethod(Enum):
     lhs = "lhs"
 
@@ -113,6 +121,13 @@ class DesignOfExperiments:
             ObjectiveLib.minimum_eigenvalue,
         }
     )
+    _FINITE_DIFFERENCE_GRADIENTS = frozenset(
+        {
+            GradientMethod.forward,
+            GradientMethod.central,
+            GradientMethod.backward,
+        }
+    )
 
     @staticmethod
     def _enum_label(value):
@@ -123,6 +138,7 @@ class DesignOfExperiments:
         self,
         experiment=None,
         experiment_list=None,
+        gradient_method=None,
         fd_formula="central",
         step=1e-3,
         objective_option="determinant",
@@ -169,9 +185,15 @@ class DesignOfExperiments:
             **DEPRECATED** - Use 'experiment_list' instead. This parameter will be removed
             in a future version. When provided, a DeprecationWarning is issued.
 
+        gradient_method:
+            Method used to compute gradients/sensitivities. Must be one of
+            [``central``, ``forward``, ``backward``, ``kaug``, ``pynumero``], default: None.
+            If None, the value of ``fd_formula`` is used for backward compatibility.
+
         fd_formula:
             Finite difference formula for computing the sensitivity matrix. Must be
-            one of [``central``, ``forward``, ``backward``], default: ``central``
+            one of [``central``, ``forward``, ``backward``], default: ``central``.
+            This is retained for backward compatibility. Prefer ``gradient_method``.
         step:
             Relative step size for the finite difference formula.
             default: 1e-3
@@ -277,8 +299,30 @@ class DesignOfExperiments:
         # Store experiment_list
         self.experiment_list = experiment_list
 
-        # Set the finite difference and subsequent step size
-        self.fd_formula = FiniteDifferenceStep(fd_formula)
+        # Resolve gradient method while preserving backward compatibility for fd_formula
+        if gradient_method is None:
+            self._gradient_method = GradientMethod(fd_formula)
+        else:
+            if fd_formula not in (None, "central", FiniteDifferenceStep.central):
+                warnings.warn(
+                    "Both 'gradient_method' and non-default 'fd_formula' were provided. "
+                    "The value of 'fd_formula' will be ignored.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            self._gradient_method = GradientMethod(gradient_method)
+
+        # Preserve legacy finite-difference paths for existing internals.
+        if self._gradient_method in self._FINITE_DIFFERENCE_GRADIENTS:
+            self.fd_formula = FiniteDifferenceStep(self._gradient_method.value)
+        else:
+            self.fd_formula = None
+
+        if self._gradient_method in self._FINITE_DIFFERENCE_GRADIENTS and step is None:
+            raise ValueError(
+                "A finite-difference step size must be provided when using "
+                "forward/central/backward gradient methods."
+            )
         self.step = step
 
         # Set the objective type and scaling options:
@@ -362,6 +406,13 @@ class DesignOfExperiments:
                       default: None --> don't save
 
         """
+        if self._gradient_method not in self._FINITE_DIFFERENCE_GRADIENTS:
+            raise NotImplementedError(
+                "run_doe currently supports only finite-difference gradient methods "
+                "('forward', 'central', 'backward'). "
+                f"Received gradient_method='{self._enum_label(self._gradient_method)}'."
+            )
+
         # Check results file name
         if results_file is not None:
             if not isinstance(results_file, (pathlib.Path, str)):
@@ -607,8 +658,13 @@ class DesignOfExperiments:
         self.results["Wall-clock Time"] = build_time + initialization_time + solve_time
 
         # Settings used to generate the optimal DoE
-        self.results["Finite Difference Scheme"] = self._enum_label(self.fd_formula)
-        self.results["Finite Difference Step"] = self.step
+        self.results["Gradient Method"] = self._enum_label(self._gradient_method)
+        self.results["Finite Difference Scheme"] = (
+            self._enum_label(self.fd_formula) if self.fd_formula is not None else None
+        )
+        self.results["Finite Difference Step"] = (
+            self.step if self.fd_formula is not None else None
+        )
         self.results["Nominal Parameter Scaling"] = self.scale_nominal_param_value
 
         # TODO: Add more useful fields to the results object?
@@ -737,6 +793,13 @@ class DesignOfExperiments:
             configured on the main DoE solver are propagated to candidate FIM
             evaluations.
         """
+        if self._gradient_method not in self._FINITE_DIFFERENCE_GRADIENTS:
+            raise NotImplementedError(
+                "optimize_experiments currently supports only finite-difference "
+                "gradient methods ('forward', 'central', 'backward'). "
+                f"Received gradient_method='{self._enum_label(self._gradient_method)}'."
+            )
+
         # Check results file name
         if results_file is not None:
             if not isinstance(results_file, (pathlib.Path, str)):
@@ -1348,8 +1411,13 @@ class DesignOfExperiments:
         self.results["Number of Experiments per Scenario"] = n_exp
         self.results["Prior FIM"] = self.prior_FIM.tolist()
         self.results["Objective expression"] = self._enum_label(self.objective_option)
-        self.results["Finite Difference Scheme"] = self._enum_label(self.fd_formula)
-        self.results["Finite Difference Step"] = self.step
+        self.results["Gradient Method"] = self._enum_label(self._gradient_method)
+        self.results["Finite Difference Scheme"] = (
+            self._enum_label(self.fd_formula) if self.fd_formula is not None else None
+        )
+        self.results["Finite Difference Step"] = (
+            self.step if self.fd_formula is not None else None
+        )
         self.results["Nominal Parameter Scaling"] = self.scale_nominal_param_value
 
         # Initialization info
@@ -2169,7 +2237,7 @@ class DesignOfExperiments:
         raise NotImplementedError("Multiple experiment optimization not yet supported.")
 
     # Compute FIM for the DoE object
-    def compute_FIM(self, model=None, method="sequential"):
+    def compute_FIM(self, model=None, method=None):
         """
         Computes the FIM for the experimental design that is
         initialized from the experiment`s ``get_labeled_model()``
@@ -2178,8 +2246,9 @@ class DesignOfExperiments:
         Parameters
         ----------
         model: model to compute FIM, default: None, (self.compute_FIM_model)
-        method: string to specify which method should be used
-                options are ``kaug`` and ``sequential``
+        method: optional string to specify which method should be used
+                options are ``kaug`` and ``sequential``.
+                If None, method is chosen from ``gradient_method``.
 
         Returns
         -------
@@ -2220,7 +2289,29 @@ class DesignOfExperiments:
         # TODO: Add a check to see if the model has an objective and deactivate it.
         #       This solve should only be a square solve without any obj function.
 
+        if method is None:
+            if self._gradient_method in self._FINITE_DIFFERENCE_GRADIENTS:
+                method = "sequential"
+            elif self._gradient_method == GradientMethod.kaug:
+                method = "kaug"
+            elif self._gradient_method == GradientMethod.pynumero:
+                raise NotImplementedError(
+                    "gradient_method='pynumero' is not yet fully integrated in "
+                    "this branch. Please use a finite-difference method or "
+                    "gradient_method='kaug'."
+                )
+            else:
+                raise DeveloperError(
+                    "Gradient method option not recognized. Please contact the "
+                    "developers as you should not see this error."
+                )
+
         if method == "sequential":
+            if self.fd_formula is None:
+                raise ValueError(
+                    "method='sequential' requires a finite-difference gradient "
+                    "method ('forward', 'central', or 'backward')."
+                )
             self._sequential_FIM(model=model)
             self._computed_FIM = self.seq_FIM
         elif method == "kaug":
@@ -2245,6 +2336,12 @@ class DesignOfExperiments:
         matrix to subsequently compute the FIM.
 
         """
+        if self.fd_formula is None:
+            raise ValueError(
+                "Sequential FIM computation requires a finite-difference gradient "
+                "method ('forward', 'central', or 'backward')."
+            )
+
         # Build a single model instance
         if model is None:
             self.compute_FIM_model = (
@@ -2514,6 +2611,13 @@ class DesignOfExperiments:
                                variables that will be created at the aggregated level (default: False)
 
         """
+        if self._gradient_method not in self._FINITE_DIFFERENCE_GRADIENTS:
+            raise NotImplementedError(
+                "create_doe_model currently supports only finite-difference "
+                "gradient methods ('forward', 'central', 'backward'). "
+                f"Received gradient_method='{self._enum_label(self._gradient_method)}'."
+            )
+
         if model is None:
             model = self.model
         else:
