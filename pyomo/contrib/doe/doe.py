@@ -125,11 +125,7 @@ class DesignOfExperiments:
         }
     )
     _FINITE_DIFFERENCE_GRADIENTS = frozenset(
-        {
-            GradientMethod.forward,
-            GradientMethod.central,
-            GradientMethod.backward,
-        }
+        {GradientMethod.forward, GradientMethod.central, GradientMethod.backward}
     )
 
     @staticmethod
@@ -2656,9 +2652,7 @@ class DesignOfExperiments:
                 jac_con_wrt_param[i, j] = der_map.get(p, 0.0)
 
         try:
-            jac_state_wrt_param = np.linalg.solve(
-                jac_con_wrt_state, -jac_con_wrt_param
-            )
+            jac_state_wrt_param = np.linalg.solve(jac_con_wrt_state, -jac_con_wrt_param)
         except np.linalg.LinAlgError as err:
             raise RuntimeError(
                 "Failed to compute symbolic sensitivities because the Jacobian of "
@@ -2942,7 +2936,9 @@ class DesignOfExperiments:
             }
             output_var_by_name = {
                 name: var
-                for name, var in zip(output_names_list, base_block.experiment_outputs.keys())
+                for name, var in zip(
+                    output_names_list, base_block.experiment_outputs.keys()
+                )
             }
 
             input_var_set = ComponentSet(base_block.experiment_inputs.keys())
@@ -3033,10 +3029,14 @@ class DesignOfExperiments:
             )
 
             def implicit_sensitivity_rule(m, c_name, p_name):
-                return sum(
-                    dcdx_expr[(c_name, x_name)] * m.state_parameter_sens[x_name, p_name]
-                    for x_name in m.pynumero_state_var_names
-                ) == -dcdp_expr[(c_name, p_name)]
+                return (
+                    sum(
+                        dcdx_expr[(c_name, x_name)]
+                        * m.state_parameter_sens[x_name, p_name]
+                        for x_name in m.pynumero_state_var_names
+                    )
+                    == -dcdp_expr[(c_name, p_name)]
+                )
 
             model.pynumero_implicit_sensitivity_constraint = pyo.Constraint(
                 model.pynumero_constraint_names,
