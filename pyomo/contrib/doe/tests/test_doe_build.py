@@ -943,6 +943,120 @@ class TestOptimizeExperimentsBuildStructure(unittest.TestCase):
         self.assertEqual(len(doe_obj.results["param_scenarios"][0]["experiments"]), 2)
 
     @unittest.skipIf(not ipopt_available, "The 'ipopt' command is not available")
+    def test_optimize_experiments_warmstarts_missing_jacobian_and_fim(self):
+        # When the user does not provide explicit Jacobian/FIM initials,
+        # optimize_experiments() should seed each experiment block from the
+        # current design point before the square solve.
+        doe_obj = DesignOfExperiments(
+            experiment=[RooneyBieglerMultiExperiment(hour=2.0)],
+            objective_option="zero",
+            step=1e-2,
+            solver=self._make_solver(),
+        )
+        expected_jac = np.array([[1.5, -0.25]])
+        expected_fim = np.array([[4.0, 1.0], [1.0, 3.0]])
+        captured = {"inspected": False, "warmstart_calls": 0}
+
+        def _mock_warmstart(experiment_index, input_values):
+            captured["warmstart_calls"] += 1
+            return expected_fim.copy(), expected_jac.copy()
+
+        def _mock_solve(*args, **kwargs):
+            model = args[0] if args else kwargs.get("model", None)
+            if model is not None and hasattr(model, "dummy_obj"):
+                scenario = model.param_scenario_blocks[0]
+                for k in scenario.exp_blocks:
+                    exp_block = scenario.exp_blocks[k]
+                    self.assertTrue(
+                        np.allclose(
+                            np.array(
+                                doe_obj.get_sensitivity_matrix(model=exp_block),
+                                dtype=float,
+                            ),
+                            expected_jac,
+                        )
+                    )
+                    self.assertTrue(
+                        np.allclose(
+                            np.array(doe_obj.get_FIM(model=exp_block), dtype=float),
+                            expected_fim,
+                        )
+                    )
+                captured["inspected"] = True
+            return self._mock_solver_results("mock-warmstart")
+
+        with (
+            patch.object(
+                doe_obj,
+                "_compute_fim_and_jac_at_point_no_prior",
+                side_effect=_mock_warmstart,
+            ),
+            patch.object(doe_obj.solver, "solve", side_effect=_mock_solve),
+        ):
+            doe_obj.optimize_experiments(n_exp=2)
+
+        self.assertTrue(captured["inspected"])
+        # Template mode uses the same starting point for both experiments, so
+        # the warm-start cache should reuse the first evaluation.
+        self.assertEqual(captured["warmstart_calls"], 1)
+        for exp_data in doe_obj.results["param_scenarios"][0]["experiments"]:
+            self.assertTrue(
+                np.allclose(np.array(exp_data["sensitivity"], dtype=float), expected_jac)
+            )
+            self.assertTrue(
+                np.allclose(np.array(exp_data["fim"], dtype=float), expected_fim)
+            )
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' command is not available")
+    def test_optimize_experiments_preserves_explicit_initial_jacobian_and_fim(self):
+        # Explicit user initials should be respected as-is, without triggering
+        # the computed warm-start path.
+        explicit_jac = np.array([[9.0, -1.0]])
+        explicit_fim = np.array([[7.0, 2.0], [2.0, 6.0]])
+        doe_obj = DesignOfExperiments(
+            experiment=[RooneyBieglerMultiExperiment(hour=2.0)],
+            objective_option="zero",
+            step=1e-2,
+            solver=self._make_solver(),
+            jac_initial=explicit_jac,
+            fim_initial=explicit_fim,
+        )
+        captured = {"inspected": False}
+
+        def _mock_solve(*args, **kwargs):
+            model = args[0] if args else kwargs.get("model", None)
+            if model is not None and hasattr(model, "dummy_obj"):
+                exp_block = model.param_scenario_blocks[0].exp_blocks[0]
+                self.assertTrue(
+                    np.allclose(
+                        np.array(doe_obj.get_sensitivity_matrix(model=exp_block)),
+                        explicit_jac,
+                    )
+                )
+                self.assertTrue(
+                    np.allclose(
+                        np.array(doe_obj.get_FIM(model=exp_block), dtype=float),
+                        explicit_fim,
+                    )
+                )
+                captured["inspected"] = True
+            return self._mock_solver_results("mock-explicit-initial")
+
+        with (
+            patch.object(
+                doe_obj,
+                "_compute_fim_and_jac_at_point_no_prior",
+                side_effect=AssertionError(
+                    "computed warm-start should not run when initials are explicit"
+                ),
+            ),
+            patch.object(doe_obj.solver, "solve", side_effect=_mock_solve),
+        ):
+            doe_obj.optimize_experiments(n_exp=1)
+
+        self.assertTrue(captured["inspected"])
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' command is not available")
     def test_optimize_experiments_trace_roundoff_flag_builds_extra_constraints(self):
         # The multi-experiment trace path optionally adds extra Cholesky/FIM
         # diagonal constraints to reduce roundoff drift. Keep the square-solve

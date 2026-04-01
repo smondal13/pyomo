@@ -878,6 +878,8 @@ class DesignOfExperiments:
         )
         lhs_init_diagnostics = None
         lhs_initialization_time = 0.0
+        user_provided_jac_initial = self.jac_initial is not None
+        user_provided_fim_initial = self.fim_initial is not None
 
         # Start timer
         sp_timer = TicTocTimer()
@@ -1125,6 +1127,24 @@ class DesignOfExperiments:
             # ------------------------------------------------------
             # Reset delta timing so initialization_time measures only square solve.
             sp_timer.tic(msg=None)
+
+            fill_initial_jacobian = not user_provided_jac_initial
+            fill_initial_fim = not user_provided_fim_initial
+            if fill_initial_jacobian or fill_initial_fim:
+                self.logger.info(
+                    "Seeding experiment Jacobian/FIM values from the current "
+                    "design points before the square initialization solve."
+                )
+                warmstart_cache = {}
+                for s in range(n_param_scenarios):
+                    for k in range(n_exp):
+                        self._seed_experiment_block_from_current_design(
+                            self.model.param_scenario_blocks[s].exp_blocks[k],
+                            experiment_index=0 if _template_mode else k,
+                            initialize_jacobian=fill_initial_jacobian,
+                            initialize_fim=fill_initial_fim,
+                            warmstart_cache=warmstart_cache,
+                        )
 
             # Solve the square problem first to initialize the FIM and sensitivity constraints
             # Deactivate objective expression and objective constraints
@@ -1743,6 +1763,33 @@ class DesignOfExperiments:
             ``(n_params, n_params)`` FIM matrix, **excluding** the prior.
             A zero matrix is returned on solver failure (with a warning).
         """
+        fim, _ = self._compute_fim_and_jac_at_point_no_prior(
+            experiment_index=experiment_index, input_values=input_values
+        )
+        return fim
+
+    def _compute_fim_and_jac_at_point_no_prior(self, experiment_index, input_values):
+        """
+        Compute the no-prior FIM and Jacobian for the given experiment at the
+        specified experiment-input values using the sequential finite-
+        difference method.
+
+        Parameters
+        ----------
+        experiment_index : int
+            Index of the experiment in ``self.experiment_list`` to evaluate.
+        input_values : list
+            Numeric values for each experiment input variable (same order as
+            ``model.experiment_inputs``).
+
+        Returns
+        -------
+        tuple
+            ``(fim, jac)`` where ``fim`` has shape ``(n_params, n_params)``
+            and ``jac`` has shape ``(n_outputs, n_params)``. Both exclude the
+            prior contribution. Zero arrays are returned on solver failure
+            (with a warning).
+        """
         # Get a fresh labeled model for this experiment
         model = (
             self.experiment_list[experiment_index]
@@ -1764,16 +1811,62 @@ class DesignOfExperiments:
         try:
             self._sequential_FIM(model=model)
             fim = self.seq_FIM.copy()
+            jac = self.seq_jac.copy()
         except Exception as exc:
             self.logger.warning(
                 f"FIM evaluation failed at point {input_values}: {exc}. "
                 "Using zero matrix as fallback."
             )
             fim = np.zeros((n_params, n_params))
+            jac = np.zeros((len(model.experiment_outputs), n_params))
         finally:
             self.prior_FIM = saved_prior
 
-        return fim
+        return fim, jac
+
+    def _seed_experiment_block_from_current_design(
+        self,
+        exp_block,
+        experiment_index,
+        initialize_jacobian=True,
+        initialize_fim=True,
+        warmstart_cache=None,
+    ):
+        """
+        Seed one experiment block from its current design point before the
+        square initialization solve.
+
+        The block-level FIM in multi-experiment mode excludes the prior, so
+        the warm start is computed through the same no-prior path used by
+        candidate-point FIM evaluation.
+        """
+        if not initialize_jacobian and not initialize_fim:
+            return
+
+        input_values = self.get_experiment_input_values(model=exp_block)
+        cache_key = (experiment_index, tuple(float(val) for val in input_values))
+        if warmstart_cache is not None and cache_key in warmstart_cache:
+            fim_np, jac_np = warmstart_cache[cache_key]
+        else:
+            fim_np, jac_np = self._compute_fim_and_jac_at_point_no_prior(
+                experiment_index=experiment_index, input_values=input_values
+            )
+            if warmstart_cache is not None:
+                warmstart_cache[cache_key] = (fim_np, jac_np)
+
+        if initialize_jacobian and hasattr(exp_block, "sensitivity_jacobian"):
+            for i, output_name in enumerate(exp_block.output_names):
+                for j, param_name in enumerate(exp_block.parameter_names):
+                    exp_block.sensitivity_jacobian[output_name, param_name].set_value(
+                        jac_np[i, j]
+                    )
+
+        if initialize_fim and hasattr(exp_block, "fim"):
+            for i, p in enumerate(exp_block.parameter_names):
+                for j, q in enumerate(exp_block.parameter_names):
+                    if self.only_compute_fim_lower and i < j:
+                        continue
+                    exp_block.fim[p, q].set_value(fim_np[i, j])
 
     def _lhs_initialize_experiments(
         self,
