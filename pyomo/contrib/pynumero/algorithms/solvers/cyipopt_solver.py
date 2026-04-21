@@ -2,7 +2,7 @@
 #
 # Pyomo: Python Optimization Modeling Objects
 # Copyright (c) 2008-2026 National Technology and Engineering Solutions of Sandia, LLC
-# Under the terms of Contract DE-NA0003525 with National Technology and Engineering
+# Under the terms of Contract DE-NA0003525 with National Technology and Engineerinkg
 # Solutions of Sandia, LLC, the U.S. Government retains certain rights in this
 # software.  This software is distributed under the 3-clause BSD License.
 # ____________________________________________________________________________________
@@ -377,7 +377,8 @@ class PyomoCyIpoptSolver:
         if grey_box_blocks and not nlp.has_hessian_support():
             # Note that `config` is a copy of the instance-level self.config so
             # we don't have to reset the option after the solve.
-            if config.options.get("hessian_approximation", None) == "exact":
+            hessian_approx = config.options.get("hessian_approximation", None)
+            if hessian_approx is not None and hessian_approx.value() == "exact":
                 logger.warning(
                     "'hessian_approximation' option is set to 'exact', but at"
                     " least one grey box model does not support Hessians."

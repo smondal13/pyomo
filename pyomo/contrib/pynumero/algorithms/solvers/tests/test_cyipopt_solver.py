@@ -7,7 +7,10 @@
 # software.  This software is distributed under the 3-clause BSD License.
 # ____________________________________________________________________________________
 
+import io
+import logging
 import pyomo.common.unittest as unittest
+from pyomo.common.log import LoggingIntercept
 import pyomo.environ as pyo
 from pyomo.common.tempfiles import TempfileManager
 
@@ -458,7 +461,11 @@ class TestCyIpoptGreyBox(unittest.TestCase):
         m.obj = pyo.Objective(expr=m.reactor.outputs["cb"], sense=pyo.maximize)
         solver = pyo.SolverFactory("cyipopt")
         solver.config.options["hessian_approximation"] = "exact"
-        results = solver.solve(m, tee=True)
+        buf = io.StringIO()
+        with LoggingIntercept(buf, "pyomo.contrib.pynumero", logging.WARNING):
+            results = solver.solve(m, tee=True)
+        msg = "at least one grey box model does not support Hessians"
+        self.assertIn(msg, buf.getvalue())
         pyo.assert_optimal_termination(results)
         self.assertEqual(solver.config.options["hessian_approximation"], "exact")
         self.assertAlmostEqual(pyo.value(m.reactor.inputs["sv"]), 1.34381, places=3)
