@@ -1152,8 +1152,9 @@ class TestOptimizeExperimentsAlgorithm(unittest.TestCase):
         total_fim = np.array(
             _optimize_experiments_param_scenario(doe.results)["total_fim"]
         )
-        expected_jitter = 1.0 + _SMALL_TOLERANCE_DEFINITENESS
-        expected_cholesky_input = total_fim + expected_jitter * np.eye(total_fim.shape[0])
+        expected_cholesky_input = total_fim + _SMALL_TOLERANCE_DEFINITENESS * np.eye(
+            total_fim.shape[0]
+        )
         param_names = list(scenario.exp_blocks[0].parameter_names)
         L_vals = np.array(
             [
@@ -1173,51 +1174,6 @@ class TestOptimizeExperimentsAlgorithm(unittest.TestCase):
         )
         self.assertTrue(
             np.allclose(L_vals @ L_vals.T, expected_cholesky_input, atol=1e-8)
-        )
-
-    def test_run_doe_square_solve_failure_restores_state(self):
-        doe = self._make_template_doe("pseudo_trace")
-        original_solve = doe.solver.solve
-
-        class _MockSolverInfo:
-            status = "warning"
-            termination_condition = "infeasible"
-            message = "mock square solve failure"
-
-        class _MockResults:
-            solver = _MockSolverInfo()
-
-        def _fail_only_square_solve(*args, **kwargs):
-            model = args[0] if args else kwargs.get("model", None)
-            if model is not None and hasattr(model, "dummy_obj"):
-                return _MockResults()
-            return original_solve(*args, **kwargs)
-
-        with patch.object(doe.solver, "solve", side_effect=_fail_only_square_solve):
-            with self.assertRaisesRegex(
-                RuntimeError, "Square initialization solve failed"
-            ):
-                doe.run_doe()
-
-        self.assertTrue(doe.model.objective.active)
-        self.assertTrue(doe.model.obj_cons.active)
-        self.assertTrue(hasattr(doe.model, "fd_scenario_blocks"))
-        self.assertTrue(hasattr(doe.model, "dummy_obj"))
-        self.assertFalse(doe.model.dummy_obj.active)
-        for comp in doe.model.fd_scenario_blocks[0].experiment_inputs:
-            self.assertFalse(comp.fixed)
-
-    def test_run_doe_metric_failure_sets_nan(self):
-        doe = self._make_template_doe("pseudo_trace")
-        with patch(
-            "pyomo.contrib.doe.doe.np.linalg.inv", side_effect=RuntimeError("boom")
-        ):
-            with self.assertLogs("pyomo.contrib.doe.doe", level="WARNING") as log_cm:
-                doe.run_doe()
-
-        self.assertTrue(np.isnan(doe.results["log10 A-opt"]))
-        self.assertTrue(
-            any("Failed to compute log10 A-opt" in msg for msg in log_cm.output)
         )
 
     def test_lhs_initialize_experiments_matches_bruteforce_combo(self):

@@ -349,13 +349,6 @@ class DesignOfExperiments:
             "'minimum_eigenvalue', 'condition_number']."
         )
 
-    @staticmethod
-    def _required_cholesky_jitter(min_eig):
-        """
-        Return the diagonal shift needed to ensure min eigenvalue >= tolerance.
-        """
-        return max(0.0, _SMALL_TOLERANCE_DEFINITENESS - float(min_eig))
-
     def _initialize_grey_box_block(self, egb_block, fim_np, parameter_names):
         """
         Seed a grey box block from the FIM computed by the square solve.
@@ -445,56 +438,44 @@ class DesignOfExperiments:
             "Successfully built the DoE model.\nBuild time: %0.1f seconds" % build_time
         )
 
-        # Solve the square problem first to initialize the FIM and sensitivity
-        # constraints. We deactivate the optimization objective and temporarily
-        # fix design inputs, then restore the original model state even if the
-        # initialization solve fails.
-        objective_was_active = model.objective.active
-        obj_cons_was_active = model.obj_cons.active
-        design_var_states = [
-            (comp, comp.fixed) for comp in model.fd_scenario_blocks[0].experiment_inputs
-        ]
-
+        # Solve the square problem first to
+        # initialize the fim and
+        # sensitivity constraints. First, we
+        # Deactivate objective expression and
+        # objective constraints (on a block),
+        # and fix the design variables.
         model.objective.deactivate()
         model.obj_cons.deactivate()
-        if hasattr(model, "dummy_obj"):
-            model.del_component(model.dummy_obj)
+        for comp in model.fd_scenario_blocks[0].experiment_inputs:
+            comp.fix()
 
-        try:
-            for comp, _was_fixed in design_var_states:
-                comp.fix()
+        # TODO: safeguard solver call to see if solver terminated successfully
+        # see below commented code:
+        # res = self.solver.solve(model, tee=self.tee, load_solutions=False)
+        # if pyo.check_optimal_termination(res):
+        #     model.load_solution(res)
+        # else:
+        #     # The solver was unsuccessful, might want to warn the user
+        #     # or terminate gracefully, etc.
+        model.dummy_obj = pyo.Objective(expr=0, sense=pyo.minimize)
+        self.solver.solve(model, tee=self.tee)
 
-            model.dummy_obj = pyo.Objective(expr=0, sense=pyo.minimize)
-            init_res = self.solver.solve(model, tee=self.tee)
-            if not pyo.check_optimal_termination(init_res):
-                raise RuntimeError(
-                    "Square initialization solve failed with "
-                    f"status={init_res.solver.status}, "
-                    "termination_condition="
-                    f"{init_res.solver.termination_condition}. "
-                    "Please check model scaling and initialization."
-                )
-
-            # Track time to initialize the DoE model
-            initialization_time = sp_timer.toc(msg=None)
-            self.logger.info(
-                (
-                    "Successfully initialized the DoE model."
-                    "\nInitialization time: %0.1f seconds" % initialization_time
-                )
+        # Track time to initialize the DoE model
+        initialization_time = sp_timer.toc(msg=None)
+        self.logger.info(
+            (
+                "Successfully initialized the DoE model."
+                "\nInitialization time: %0.1f seconds" % initialization_time
             )
-        finally:
-            if hasattr(model, "dummy_obj"):
-                model.dummy_obj.deactivate()
-            for comp, was_fixed in design_var_states:
-                if was_fixed:
-                    comp.fix()
-                else:
-                    comp.unfix()
-            if objective_was_active:
-                model.objective.activate()
-            if obj_cons_was_active:
-                model.obj_cons.activate()
+        )
+
+        model.dummy_obj.deactivate()
+
+        # Reactivate objective and unfix experimental design decisions
+        for comp in model.fd_scenario_blocks[0].experiment_inputs:
+            comp.unfix()
+        model.objective.activate()
+        model.obj_cons.activate()
 
         if self.use_grey_box:
             self._initialize_grey_box_block(
@@ -520,10 +501,23 @@ class DesignOfExperiments:
             if self.only_compute_fim_lower:
                 fim_np = fim_np + fim_np.T - np.diag(np.diag(fim_np))
 
-            # Check if the FIM is positive definite.
-            # If not, add diagonal jitter so min eigenvalue meets tolerance.
+            # Check if the FIM is positive definite
+            # If not, add jitter to the diagonal
+            # to ensure positive definiteness
             min_eig = np.min(np.real(np.linalg.eigvals(fim_np)))
-            jitter = self._required_cholesky_jitter(min_eig)
+
+            if min_eig < _SMALL_TOLERANCE_DEFINITENESS:
+                # Raise the minimum eigenvalue to at
+                # least _SMALL_TOLERANCE_DEFINITENESS
+                jitter = np.min(
+                    [
+                        -min_eig + _SMALL_TOLERANCE_DEFINITENESS,
+                        _SMALL_TOLERANCE_DEFINITENESS,
+                    ]
+                )
+            else:
+                # No jitter needed
+                jitter = 0
 
             # Add jitter to the diagonal to ensure positive definiteness
             L_vals_sq = np.linalg.cholesky(
@@ -616,37 +610,12 @@ class DesignOfExperiments:
         self.results["Prior FIM"] = self.prior_FIM.tolist()
 
         # Saving some stats on the FIM for convenience
-        def _safe_metric(metric_name, compute_fn):
-            try:
-                val = float(compute_fn())
-                return val if np.isfinite(val) else float("nan")
-            except Exception as exc:
-                self.logger.warning(
-                    f"Failed to compute {metric_name}: {exc}. Setting metric to NaN."
-                )
-                return float("nan")
-
         self.results["Objective expression"] = self._enum_label(self.objective_option)
-        self.results["log10 A-opt"] = _safe_metric(
-            "log10 A-opt",
-            lambda fim=fim_local: np.log10(np.trace(np.linalg.inv(fim))),
-        )
-        self.results["log10 pseudo A-opt"] = _safe_metric(
-            "log10 pseudo A-opt",
-            lambda fim=fim_local: np.log10(np.trace(fim)),
-        )
-        self.results["log10 D-opt"] = _safe_metric(
-            "log10 D-opt",
-            lambda fim=fim_local: np.log10(np.linalg.det(fim)),
-        )
-        self.results["log10 E-opt"] = _safe_metric(
-            "log10 E-opt",
-            lambda fim=fim_local: np.log10(min(np.linalg.eigvalsh(fim))),
-        )
-        self.results["FIM Condition Number"] = _safe_metric(
-            "FIM Condition Number",
-            lambda fim=fim_local: np.linalg.cond(fim),
-        )
+        self.results["log10 A-opt"] = np.log10(np.trace(np.linalg.inv(fim_local)))
+        self.results["log10 pseudo A-opt"] = np.log10(np.trace(fim_local))
+        self.results["log10 D-opt"] = np.log10(np.linalg.det(fim_local))
+        self.results["log10 E-opt"] = np.log10(min(np.linalg.eig(fim_local)[0]))
+        self.results["FIM Condition Number"] = np.linalg.cond(fim_local)
 
         # Solve timing stats
         self.results["Build Time"] = build_time
@@ -1247,7 +1216,15 @@ class DesignOfExperiments:
                     # Compute Cholesky factorization
                     # Check positive definiteness and add jitter if needed
                     min_eig = np.min(np.real(np.linalg.eigvals(total_fim_np)))
-                    jitter = self._required_cholesky_jitter(min_eig)
+                    if min_eig < _SMALL_TOLERANCE_DEFINITENESS:
+                        jitter = np.min(
+                            [
+                                -min_eig + _SMALL_TOLERANCE_DEFINITENESS,
+                                _SMALL_TOLERANCE_DEFINITENESS,
+                            ]
+                        )
+                    else:
+                        jitter = 0
 
                     fim_jittered = total_fim_np + jitter * np.eye(len(parameter_names))
 
