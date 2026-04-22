@@ -2504,11 +2504,11 @@ class DesignOfExperiments:
             # next finite-difference perturbation. Keep legacy progression
             # (no explicit reset between scenarios) for determinant+Cholesky
             # to preserve robust warm starts in dynamic-model D-opt solves.
-            if not (
-                self.objective_option == ObjectiveLib.determinant
-                and self.Cholesky_option
-            ):
-                param.set_value(model.unknown_parameters[param])
+            # if not (
+            #     self.objective_option == ObjectiveLib.determinant
+            #     and self.Cholesky_option
+            # ):
+            # param.set_value(model.unknown_parameters[param])
 
             # Extract the measurement values for the scenario and append
             measurement_vals.append(
