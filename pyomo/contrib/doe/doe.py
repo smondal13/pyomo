@@ -3127,15 +3127,7 @@ class DesignOfExperiments:
                 b
             ).set_value(parent_block.base_model.unknown_parameters[param] * (1 + diff))
 
-            # Fix experiment inputs before solve (enforce square solve)
-            for comp in b.experiment_inputs:
-                comp.fix()
-
             res = self.solver.solve(b, tee=self.tee)
-
-            # Unfix experiment inputs after square solve
-            for comp in b.experiment_inputs:
-                comp.unfix()
 
         model.fd_scenario_blocks = pyo.Block(
             model.scenarios, rule=build_block_scenarios
