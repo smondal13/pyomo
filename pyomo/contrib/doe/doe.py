@@ -2566,7 +2566,7 @@ class DesignOfExperiments:
         cov_y = np.zeros((len(model.measurement_error), len(model.measurement_error)))
         count = 0
         for k, v in model.measurement_error.items():
-            cov_y[count, count] = 1 / v**2
+            cov_y[count, count] = 1 / v
             count += 1
 
         # Compute and record FIM
@@ -2659,7 +2659,7 @@ class DesignOfExperiments:
         cov_y = np.zeros((len(model.measurement_error), len(model.measurement_error)))
         count = 0
         for k, v in model.measurement_error.items():
-            cov_y[count, count] = 1 / v**2
+            cov_y[count, count] = 1 / v
             count += 1
 
         # TODO: need to add a covariance matrix for measurements (sigma inverse)
@@ -2942,7 +2942,6 @@ class DesignOfExperiments:
                                 m.fd_scenario_blocks[0]
                             )
                         ]
-                        ** 2
                         * m.sensitivity_jacobian[n, p]
                         * m.sensitivity_jacobian[n, q]
                         for n in m.output_names
@@ -2957,7 +2956,6 @@ class DesignOfExperiments:
                                     m.fd_scenario_blocks[0]
                                 )
                             ]
-                            ** 2
                             * m.sensitivity_jacobian[n, p]
                             * m.sensitivity_jacobian[n, q]
                             for n in m.output_names
