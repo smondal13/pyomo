@@ -45,7 +45,6 @@ import json
 from collections.abc import Callable
 from itertools import combinations
 from functools import singledispatchmethod
-from collections import defaultdict
 
 from pyomo.common.dependencies import (
     attempt_import,
@@ -389,11 +388,18 @@ def _format_outputs_index_as_tuple(index):
 
 def validate_experiment_outputs(output_vars):
     """
-    Checks that:
-    1. All variables in the `experiment_outputs` attribute have the same
-    number of indices
-    2. All variables in the `experiment_outputs` attribute share the same
-    index set
+    Checks that every indexed variable in the `experiment_outputs` attribute
+    uses its first index as the data point (e.g., time) index.
+
+    Output variable families (grouped by parent component, e.g., `m.CA`,
+    `m.CB`) are *not* required to share the same index set. Different
+    quantities measured within the same experiment may be sampled at
+    different data points -- e.g., `m.CA[t]` may be recorded at
+    ``t in {1, 2, 3}`` while `m.CB[t]` is only recorded at
+    ``t in {1, 2}`` -- to represent genuinely different sampling designs
+    or missing/skipped readings for a given quantity.
+    ``_count_total_experiments`` accounts for this heterogeneity when
+    counting data points; see its docstring for details.
 
     Parameters
     ----------
@@ -401,60 +407,33 @@ def validate_experiment_outputs(output_vars):
         Experiment output variables
     """
 
-    grouped_indices = defaultdict(list)
-
-    # group indices by parent component
     for comp in output_vars:
         index = comp.index()
 
         # check if the output variable is a scalar (e.g., m.y1, m.y2)
         if index is None:
-            pass
-        else:
-            # format the index of output variables
-            # (e.g., m.CA[t], m.CB[t], m.C[t, "A"], m.C[t, "B"]) as a tuple
-            index_tuple = _format_outputs_index_as_tuple(index)
+            continue
 
-            # check if the first indexing is the data index
-            assert isinstance(
-                index_tuple[0], (int, float)
-            ), "The first index of experiment outputs must be the data point"
+        # format the index of output variables
+        # (e.g., m.CA[t], m.CB[t], m.C[t, "A"], m.C[t, "B"]) as a tuple
+        index_tuple = _format_outputs_index_as_tuple(index)
 
-        parent = comp.parent_component().name
-        grouped_indices[parent].append(index)
-
-    # convert to a sorted unique tuples
-    grouped_indices = {
-        name: tuple(sorted(indices)) for name, indices in grouped_indices.items()
-    }
-
-    # reference index set
-    names = list(grouped_indices.keys())
-
-    if len(names) <= 1:  # only one output variable exist
-        pass
-    else:
-        ref_name = names[0]
-        ref_indices = grouped_indices[ref_name]
-
-        for name in names[1:]:
-            assert len(grouped_indices[name]) == len(
-                ref_indices
-            ), "Experiment outputs must have the same number of indices or data points"
-
-            assert (
-                grouped_indices[name] == ref_indices
-            ), "Experiment outputs must share the same indices or data points"
+        # check if the first indexing is the data index
+        assert isinstance(
+            index_tuple[0], (int, float)
+        ), "The first index of experiment outputs must be the data point"
 
 
 def _count_total_experiments(experiment_list):
     """
     Counts the number of data points in the list of experiments
 
-    This function has been updated to avoid double counting data points in
-    cases where the "experiment_outputs" suffix contain keys that belong
-    to different output variables (e.g., `m.y1`, `m.y2`) which are measured at
-    the same data point
+    This function avoids double counting data points in cases where the
+    "experiment_outputs" suffix contains keys that belong to different
+    output variables (e.g., `m.y1`, `m.y2`) which are measured at the
+    same data point. It does so by counting the number of *unique* data
+    points recorded anywhere in an experiment, rather than the number of
+    output-variable entries.
 
     Assumptions:
 
@@ -462,12 +441,18 @@ def _count_total_experiments(experiment_list):
     or
     Experiment outputs can be indexed variables (e.g., `m.CA[t]`, `m.CB[t]`,
     `m.C[t, "A"]`, `m.C[t, "B"]`). The data-point variable (e.g., `t`) must
-    be the first index. Within each experiment, the output families are
-    expected to share the same time points. Across experiments, the output
-    families are expected to contain the same number of time points.
+    be the first index.
 
-    Future versions will allow for heterogeneity in the number of data points
-    across experiments and will require changes to this function.
+    Within an experiment, different output families are *not* required to
+    share the same set of data points -- e.g., `m.CA[t]` may be recorded at
+    ``t in {1, 2, 3}`` while `m.CB[t]` is only recorded at ``t in {1, 2}``,
+    representing a different sampling design or a missing/skipped reading
+    for one of the quantities. In that case, the total data-point count
+    for the experiment is the number of distinct data-point values (e.g.,
+    time values) that appear across *any* of the output families -- in the
+    example above, that is 3 (``{1, 2, 3}``), not 5. Across experiments,
+    the output families are expected to contain the same number of time
+    points (this is not currently checked).
 
     Parameters
     ----------

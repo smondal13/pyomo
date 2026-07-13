@@ -2173,6 +2173,61 @@ class IndexedOutputExperiment(Experiment):
         return self.model
 
 
+class HeterogeneousIndexedOutputExperiment(Experiment):
+    """
+    Experiment with two output families ("y" and "z") that are sampled
+    at different, independently-specified data points (e.g., time values)
+    within the same experiment. This represents measured quantities with
+    different sampling schedules, or a family with missing/skipped
+    readings for some data points.
+    """
+
+    def __init__(self, theta_true, y_times, z_times):
+        self.theta_true = theta_true
+        self.y_times = list(y_times)
+        self.z_times = list(z_times)
+        self.model = None
+
+    def create_model(self):
+        m = pyo.ConcreteModel()
+
+        m.theta = pyo.Var(initialize=0.0, bounds=(-10.0, 10.0))
+
+        m.y_index = pyo.Set(ordered=True, initialize=self.y_times)
+        m.z_index = pyo.Set(ordered=True, initialize=self.z_times)
+
+        m.y = pyo.Var(m.y_index, initialize=0.0)
+        m.z = pyo.Var(m.z_index, initialize=0.0)
+
+        m.y_link = pyo.Constraint(m.y_index, rule=lambda m, t: m.y[t] == m.theta * t)
+        m.z_link = pyo.Constraint(
+            m.z_index, rule=lambda m, t: m.z[t] == 2.0 * m.theta * t
+        )
+
+        self.model = m
+
+    def label_model(self):
+        m = self.model
+
+        m.experiment_outputs = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+        m.experiment_outputs.update((m.y[t], self.theta_true * t) for t in self.y_times)
+        m.experiment_outputs.update(
+            (m.z[t], 2.0 * self.theta_true * t) for t in self.z_times
+        )
+
+        m.unknown_parameters = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+        m.unknown_parameters.update([(m.theta, pyo.ComponentUID(m.theta))])
+
+        m.measurement_error = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+        m.measurement_error.update((m.y[t], None) for t in self.y_times)
+        m.measurement_error.update((m.z[t], None) for t in self.z_times)
+
+    def get_labeled_model(self):
+        self.create_model()
+        self.label_model()
+        return self.model
+
+
 def _build_estimator(data, include_second_output=False):
     exp_list = [
         LinearThetaExperiment(x=x, y=y, include_second_output=include_second_output)
@@ -2403,31 +2458,47 @@ class TestCountTotalExperiments(unittest.TestCase):
 
         self.assertEqual(total_points, 4)
 
-    def test_count_total_experiments_rejects_mismatched_output_lengths(self):
+    def test_count_total_experiments_allows_mismatched_output_lengths(self):
+        # "z" has fewer data points than "y" (e.g., a missing/skipped
+        # reading) -- this is allowed, and the unique data points recorded
+        # across both families are counted.
         exp_list = [
             IndexedOutputExperiment(
                 y_points=[(0.0, "A"), (1.0, "A")], z_points=[(0.0, "A")]
             )
         ]
 
-        with self.assertRaisesRegex(
-            AssertionError,
-            "Experiment outputs must have the same number of indices or data points",
-        ):
-            parmest._count_total_experiments(exp_list)
+        total_points = parmest._count_total_experiments(exp_list)
 
-    def test_count_total_experiments_rejects_mismatched_time_points(self):
+        # unique data points across both families: {0.0, 1.0}
+        self.assertEqual(total_points, 2)
+
+    def test_count_total_experiments_allows_mismatched_time_points(self):
+        # "y" and "z" are sampled at different (partially overlapping)
+        # time points within the same experiment -- this is allowed.
         exp_list = [
             IndexedOutputExperiment(
                 y_points=[(0.0, "A"), (1.0, "A")], z_points=[(0.0, "A"), (2.0, "A")]
             )
         ]
 
-        with self.assertRaisesRegex(
-            AssertionError,
-            "Experiment outputs must share the same indices or data points",
-        ):
-            parmest._count_total_experiments(exp_list)
+        total_points = parmest._count_total_experiments(exp_list)
+
+        # unique data points across both families: {0.0, 1.0, 2.0}
+        self.assertEqual(total_points, 3)
+
+    def test_count_total_experiments_allows_disjoint_time_points(self):
+        # "y" and "z" are sampled at entirely disjoint time points.
+        exp_list = [
+            IndexedOutputExperiment(
+                y_points=[(0.0, "A"), (1.0, "A"), (2.0, "A")], z_points=[(3.0, "A")]
+            )
+        ]
+
+        total_points = parmest._count_total_experiments(exp_list)
+
+        # unique data points across both families: {0.0, 1.0, 2.0, 3.0}
+        self.assertEqual(total_points, 4)
 
     def test_count_total_experiments_rejects_time_not_in_first_index(self):
         exp_list = [
@@ -2442,6 +2513,68 @@ class TestCountTotalExperiments(unittest.TestCase):
         ):
             parmest._count_total_experiments(exp_list)
 
+
+@unittest.skipIf(
+    not parmest.parmest_available,
+    "Cannot test parmest: required dependencies are missing",
+)
+class TestHeterogeneousExperimentOutputs(unittest.TestCase):
+    """
+    Tests covering experiments whose output families are measured at
+    genuinely different (or partially overlapping) data points, e.g.,
+    different sensors on different sampling schedules within one
+    experiment.
+    """
+
+    def test_count_total_experiments_different_families_different_grids(self):
+        exp_list = [
+            HeterogeneousIndexedOutputExperiment(
+                theta_true=2.0, y_times=[1, 2, 3], z_times=[1, 2]
+            ),
+            HeterogeneousIndexedOutputExperiment(
+                theta_true=2.0, y_times=[1, 2, 3], z_times=[1, 2]
+            ),
+        ]
+
+        total_points = parmest._count_total_experiments(exp_list)
+
+        # per experiment, the unique data points across "y" ({1,2,3}) and
+        # "z" ({1,2}) are {1,2,3} -> 3 data points per experiment
+        self.assertEqual(total_points, 6)
+
+    def test_count_total_experiments_family_with_missing_reading(self):
+        # "z" is missing the reading at t=3 in this experiment (e.g., a
+        # sensor fault), while "y" still has all three readings.
+        exp_list = [
+            HeterogeneousIndexedOutputExperiment(
+                theta_true=2.0, y_times=[1, 2, 3], z_times=[1, 2]
+            )
+        ]
+
+        total_points = parmest._count_total_experiments(exp_list)
+
+        self.assertEqual(total_points, 3)
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_theta_est_with_heterogeneous_output_families(self):
+        exp_list = [
+            HeterogeneousIndexedOutputExperiment(
+                theta_true=2.0, y_times=[1, 2, 3], z_times=[1, 2]
+            ),
+            HeterogeneousIndexedOutputExperiment(
+                theta_true=2.0, y_times=[1, 2], z_times=[1, 2, 3]
+            ),
+        ]
+
+        pest = parmest.Estimator(exp_list, obj_function="SSE")
+        obj_val, theta_val = pest.theta_est()
+
+        self.assertAlmostEqual(theta_val["theta"], 2.0, places=6)
+        self.assertAlmostEqual(obj_val, 0.0, places=6)
+
+        # experiment 1: {1,2,3} U {1,2} = {1,2,3} -> 3 points
+        # experiment 2: {1,2} U {1,2,3} = {1,2,3} -> 3 points
+        self.assertEqual(pest.number_exp, 6)
 
 ###########################
 # tests for deprecated UI #

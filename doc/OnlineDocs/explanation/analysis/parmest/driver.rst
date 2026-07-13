@@ -81,6 +81,12 @@ Pyomo `Suffix` components.
 
 * ``m.experiment_outputs`` maps the experiment output (or measurement) terms in the model
   (Pyomo `Param`, `Var`, or `Expression`) to their associated data values (float, int).
+  When an output term is indexed (e.g., ``m.CA[t]``), the first index is assumed to be
+  the data point (e.g., time) at which the measurement was taken. Different output
+  quantities are not required to share the same set of data points within an
+  experiment -- e.g., ``m.CA[t]`` may be measured at ``t in {1, 2, 3}`` while
+  ``m.CB[t]`` is only measured at ``t in {1, 2}``, representing a different sampling
+  schedule or a missing/skipped reading for one of the quantities.
 * ``m.unknown_parameters`` maps the model parameters to estimate (Pyomo `Param` or `Var`)
   to their component unique identifier (Pyomo `ComponentUID`) which is used to identify equivalent
   parameters across multiple experiments.
