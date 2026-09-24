@@ -41,8 +41,11 @@ from pyomo.common.dependencies import (
     scipy_available,
 )
 
+from pyomo.common.collections import ComponentSet
 from pyomo.common.errors import DeveloperError
 from pyomo.common.timing import TicTocTimer
+from pyomo.core.expr.calculus.diff_with_pyomo import reverse_ad, reverse_sd
+from pyomo.core.expr.visitor import identify_variables
 
 from pyomo.contrib.sensitivity_toolbox.sens import get_dsdp
 
@@ -73,6 +76,14 @@ class FiniteDifferenceStep(Enum):
     backward = "backward"
 
 
+class GradientMethod(Enum):
+    forward = "forward"  # finite difference forward method
+    central = "central"  # finite difference central method
+    backward = "backward"  # finite difference backward method
+    pynumero = "pynumero"  # automatic/symbolic differentiation using PyNumero
+    kaug = "kaug"  # automatic differentiation using k_aug
+
+
 class InitializationMethod(Enum):
     latin_hypercube_sampling = "latin_hypercube_sampling"
 
@@ -100,6 +111,9 @@ class DesignOfExperiments:
             ObjectiveLib.minimum_eigenvalue,
         }
     )
+    _FINITE_DIFFERENCE_GRADIENTS = frozenset(
+        {GradientMethod.forward, GradientMethod.central, GradientMethod.backward}
+    )
 
     def __init__(
         self,
@@ -123,6 +137,7 @@ class DesignOfExperiments:
         improve_cholesky_roundoff_error=False,
         _Cholesky_option=True,
         _only_compute_fim_lower=True,
+        gradient_method=None,
     ):
         """This package enables model-based design of experiments analysis
         with Pyomo.  Both direct optimization and enumeration modes are
@@ -146,12 +161,26 @@ class DesignOfExperiments:
               - ``experimental_outputs``
               - ``measurement_error``.
 
+        gradient_method:
+            Method used to compute gradients/sensitivities. Must be one of
+            [``central``, ``forward``, ``backward``, ``kaug``, ``pynumero``], default: None.
+            If None, the value of ``fd_formula`` is used for backward compatibility.
         fd_formula:
             Finite difference formula for computing the sensitivity matrix. Must be
-            one of [``central``, ``forward``, ``backward``], default: ``central``
+            one of [``central``, ``forward``, ``backward``], default: ``central``.
+            This is retained for backward compatibility. Prefer ``gradient_method``.
         step:
-            Relative step size for the finite difference formula.
-            default: 1e-3
+            Relative step size for the finite difference formula. Either a
+            single float applied to every unknown parameter (default: 1e-3),
+            or a dict mapping parameter name (as it appears in
+            ``model.unknown_parameters``/``model.parameter_names``, e.g.
+            ``{"beta_0": 1e-2, "default": 1e-3}``) to its own relative step.
+            A dict entry is required for every parameter that should not use
+            the ``"default"`` entry; a parameter missing from the dict with
+            no ``"default"`` key raises a ``KeyError`` when the model is
+            built. Per-parameter steps are useful when one parameter's FD
+            step must be larger (to reduce sensitivity-amplification noise)
+            than another's bounds can tolerate under a single shared step.
         objective_option:
             String representation of the objective option. Current available options
             are:
@@ -241,8 +270,29 @@ class DesignOfExperiments:
         # Store experiment_list
         self.experiment_list = experiment_list
 
-        # Set the finite difference and subsequent step size
-        self.fd_formula = FiniteDifferenceStep(fd_formula)
+        # Route legacy finite-difference selections through the unified gradient API.
+        if gradient_method is None:
+            self._gradient_method = GradientMethod(fd_formula)
+        else:
+            if fd_formula not in (None, "central", FiniteDifferenceStep.central):
+                warnings.warn(
+                    "Both 'gradient_method' and non-default 'fd_formula' were provided. "
+                    "The value of 'fd_formula' will be ignored.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            self._gradient_method = GradientMethod(gradient_method)
+
+        if self._gradient_method in self._FINITE_DIFFERENCE_GRADIENTS:
+            self.fd_formula = FiniteDifferenceStep(self._gradient_method.value)
+        else:
+            self.fd_formula = None
+
+        if self._gradient_method in self._FINITE_DIFFERENCE_GRADIENTS and step is None:
+            raise ValueError(
+                "A finite-difference step size must be provided when using "
+                "forward/central/backward gradient methods."
+            )
         self.step = step
 
         # Set the objective type and scaling options:
@@ -448,6 +498,13 @@ class DesignOfExperiments:
                       to in the form of a .json file
                       default: None --> don't save
         """
+        if self._gradient_method not in self._FINITE_DIFFERENCE_GRADIENTS:
+            raise NotImplementedError(
+                "run_doe currently supports only finite-difference gradient methods "
+                "('forward', 'central', 'backward'). "
+                f"Received gradient_method='{self._enum_label(self._gradient_method)}'."
+            )
+
         # Check results file name
         if results_file is not None:
             if not isinstance(results_file, (pathlib.Path, str)):
@@ -614,8 +671,13 @@ class DesignOfExperiments:
         self.results["Wall-clock Time"] = build_time + initialization_time + solve_time
 
         # Settings used to generate the optimal DoE
-        self.results["Finite Difference Scheme"] = self._enum_label(self.fd_formula)
-        self.results["Finite Difference Step"] = self.step
+        self.results["Gradient Method"] = self._enum_label(self._gradient_method)
+        self.results["Finite Difference Scheme"] = (
+            self._enum_label(self.fd_formula) if self.fd_formula is not None else None
+        )
+        self.results["Finite Difference Step"] = (
+            self.step if self.fd_formula is not None else None
+        )
         self.results["Nominal Parameter Scaling"] = self.scale_nominal_param_value
 
         # TODO: Add more useful fields to the results object?
@@ -747,6 +809,13 @@ class DesignOfExperiments:
             local optima.
 
         """
+        if self._gradient_method == GradientMethod.kaug:
+            raise NotImplementedError(
+                "optimize_experiments currently supports finite-difference and "
+                "pynumero gradient methods. "
+                f"Received gradient_method='{self._enum_label(self._gradient_method)}'."
+            )
+
         if results_file is not None and not isinstance(
             results_file, (pathlib.Path, str)
         ):
@@ -1344,8 +1413,15 @@ class DesignOfExperiments:
                 "number_of_param_scenarios": n_param_scenarios,
                 "number_of_experiments_per_scenario": n_exp,
                 "used_template_experiment": template_mode,
-                "finite_difference_scheme": self._enum_label(self.fd_formula),
-                "finite_difference_step": self.step,
+                "gradient_method": self._enum_label(self._gradient_method),
+                "finite_difference_scheme": (
+                    self._enum_label(self.fd_formula)
+                    if self.fd_formula is not None
+                    else None
+                ),
+                "finite_difference_step": (
+                    self.step if self.fd_formula is not None else None
+                ),
                 "scaled_nominal_parameters": self.scale_nominal_param_value,
                 "prior_fim": self.prior_FIM.tolist(),
                 "measurement_error_values": measurement_error_values,
@@ -1588,8 +1664,8 @@ class DesignOfExperiments:
     def _compute_fim_at_point_no_prior(self, experiment_index, input_values):
         """
         Compute the FIM (without the prior FIM contribution) for the given
-        experiment at the specified experiment-input values using the
-        sequential finite-difference method.
+        experiment at the specified experiment-input values using the current
+        gradient method.
 
         Parameters
         ----------
@@ -1624,8 +1700,20 @@ class DesignOfExperiments:
         self.prior_FIM = np.zeros((n_params, n_params))
 
         try:
-            self._sequential_FIM(model=model)
-            fim = self.seq_FIM.copy()
+            if self._gradient_method in self._FINITE_DIFFERENCE_GRADIENTS:
+                self._sequential_FIM(model=model)
+                fim = self.seq_FIM.copy()
+            elif self._gradient_method == GradientMethod.pynumero:
+                self._pynumero_FIM(model=model)
+                fim = self.pynumero_FIM.copy()
+            elif self._gradient_method == GradientMethod.kaug:
+                self._kaug_FIM(model=model)
+                fim = self.kaug_FIM.copy()
+            else:
+                raise DeveloperError(
+                    "Gradient method option not recognized. Please contact the "
+                    "developers as you should not see this error."
+                )
         except Exception as exc:
             self.logger.warning(
                 f"FIM evaluation failed at point {input_values}: {exc}. "
@@ -1854,7 +1942,7 @@ class DesignOfExperiments:
         raise NotImplementedError("Multiple experiment optimization not yet supported.")
 
     # Compute FIM for the DoE object
-    def compute_FIM(self, model=None, method="sequential"):
+    def compute_FIM(self, model=None, method=None):
         """
         Computes the FIM for the experimental design that is
         initialized from the experiment`s ``get_labeled_model()``
@@ -1863,8 +1951,9 @@ class DesignOfExperiments:
         Parameters
         ----------
         model: model to compute FIM, default: None, (self.compute_FIM_model)
-        method: string to specify which method should be used
-                options are ``kaug`` and ``sequential``
+        method: optional string to specify which method should be used
+                options are ``kaug``, ``pynumero``, and ``sequential``.
+                If None, the method is chosen from ``gradient_method``.
 
         Notes
         -----
@@ -1917,18 +2006,39 @@ class DesignOfExperiments:
         # TODO: Add a check to see if the model has an objective and deactivate it.
         #       This solve should only be a square solve without any obj function.
 
+        if method is None:
+            if self._gradient_method in self._FINITE_DIFFERENCE_GRADIENTS:
+                method = "sequential"
+            elif self._gradient_method == GradientMethod.kaug:
+                method = "kaug"
+            elif self._gradient_method == GradientMethod.pynumero:
+                method = "pynumero"
+            else:
+                raise DeveloperError(
+                    "Gradient method option not recognized. Please contact the "
+                    "developers as you should not see this error."
+                )
+
         def _compute_fim_for_model(eval_model):
             if method == "sequential":
+                if self.fd_formula is None:
+                    raise ValueError(
+                        "method='sequential' requires a finite-difference gradient "
+                        "method ('forward', 'central', or 'backward')."
+                    )
                 self._sequential_FIM(model=eval_model)
                 return np.array(self.seq_FIM, copy=True)
             elif method == "kaug":
                 self._kaug_FIM(model=eval_model)
                 return np.array(self.kaug_FIM, copy=True)
+            elif method in ("pynumero", "symbolic"):
+                self._pynumero_FIM(model=eval_model)
+                return np.array(self.pynumero_FIM, copy=True)
             else:
                 raise ValueError(
                     (
-                        "The method provided, {}, must be either `sequential` "
-                        "or `kaug`".format(method)
+                        "The method provided, {}, must be one of `sequential`, "
+                        "`kaug`, or `pynumero`".format(method)
                     )
                 )
 
@@ -2003,6 +2113,20 @@ class DesignOfExperiments:
 
         return self._computed_FIM
 
+    def _step_for(self, param_name):
+        """Resolve ``self.step`` (a float, or a {param_name: step} dict) to
+        the relative FD step size for one named unknown parameter."""
+        if not isinstance(self.step, dict):
+            return self.step
+        if param_name in self.step:
+            return self.step[param_name]
+        if "default" in self.step:
+            return self.step["default"]
+        raise KeyError(
+            f"'step' dict has no entry for parameter {param_name!r} and no "
+            "'default' key to fall back to."
+        )
+
     # Use a sequential method to get the FIM
     def _sequential_FIM(self, model=None):
         """
@@ -2012,6 +2136,12 @@ class DesignOfExperiments:
         matrix to subsequently compute the FIM.
 
         """
+        if self.fd_formula is None:
+            raise ValueError(
+                "Sequential FIM computation requires a finite-difference gradient "
+                "method ('forward', 'central', or 'backward')."
+            )
+
         # Build a single model instance
         if model is None:
             self.compute_FIM_model = (
@@ -2059,18 +2189,6 @@ class DesignOfExperiments:
         # In a loop.....
         # Calculate measurement values for each scenario
         for s in model.scenarios:
-            # Perturbation to be (1 + diff) * param_value
-            if self.fd_formula == FiniteDifferenceStep.central:
-                diff = self.step * (
-                    (-1) ** s
-                )  # Positive perturbation, even; negative, odd
-            elif self.fd_formula == FiniteDifferenceStep.backward:
-                diff = (
-                    self.step * -1 * (s != 0)
-                )  # Backward always negative perturbation; 0 at s = 0
-            elif self.fd_formula == FiniteDifferenceStep.forward:
-                diff = self.step * (s != 0)  # Forward always positive; 0 at s = 0
-
             # If we are doing forward/backward, no change for s=0
             skip_param_update = (
                 self.fd_formula
@@ -2078,6 +2196,16 @@ class DesignOfExperiments:
             ) and (s == 0)
             if not skip_param_update:
                 param = model.parameter_scenarios[s]
+                step = self._step_for(param.local_name)
+
+                # Perturbation to be (1 + diff) * param_value
+                if self.fd_formula == FiniteDifferenceStep.central:
+                    diff = step * ((-1) ** s)  # Positive perturbation, even; negative, odd
+                elif self.fd_formula == FiniteDifferenceStep.backward:
+                    diff = step * -1  # Backward always negative perturbation
+                elif self.fd_formula == FiniteDifferenceStep.forward:
+                    diff = step  # Forward always positive
+
                 # Update parameter values for the given finite difference scenario
                 param.set_value(model.unknown_parameters[param] * (1 + diff))
             else:
@@ -2123,7 +2251,7 @@ class DesignOfExperiments:
         # columns for finite difference calculation
 
         for k, v in model.unknown_parameters.items():
-            curr_step = v * self.step
+            curr_step = v * self._step_for(k.local_name)
 
             if self.fd_formula == FiniteDifferenceStep.central:
                 col_1 = 2 * i
@@ -2259,6 +2387,127 @@ class DesignOfExperiments:
 
         self.kaug_FIM = self.kaug_jac.T @ cov_y @ self.kaug_jac + self.prior_FIM
 
+    def _compute_symbolic_sensitivity_matrix(self, model):
+        """
+        Compute d(outputs)/d(parameters) via implicit differentiation of
+        active equality constraints at the current model point.
+        """
+        con_set = ComponentSet()
+        var_set = ComponentSet()
+        param_set = ComponentSet()
+
+        for param in model.unknown_parameters.keys():
+            param_set.add(param)
+
+        for con in model.component_data_objects(
+            pyo.Constraint, descend_into=True, active=True
+        ):
+            if not con.equality:
+                continue
+            con_set.add(con)
+            for var in identify_variables(con.body, include_fixed=False):
+                var_set.add(var)
+
+        # Fixed unknown parameters are omitted by identify_variables, but their
+        # derivatives are still required for local parameter sensitivities.
+        for param in param_set:
+            var_set.add(param)
+
+        con_list = list(con_set)
+        param_list = list(param_set)
+        state_vars = [var for var in var_set if var not in param_set]
+
+        if len(con_list) != len(state_vars):
+            raise ValueError(
+                "For gradient_method='pynumero', the model must satisfy a square "
+                "implicit system: number of active equality constraints must equal "
+                "number of state variables (excluding unknown parameters). "
+                f"Got {len(con_list)} constraints and {len(state_vars)} state vars."
+            )
+
+        jac_con_wrt_state = np.zeros((len(con_list), len(state_vars)))
+        jac_con_wrt_param = np.zeros((len(con_list), len(param_list)))
+
+        for i, con in enumerate(con_list):
+            derivative_map = reverse_ad(con.body)
+            for j, var in enumerate(state_vars):
+                jac_con_wrt_state[i, j] = derivative_map.get(var, 0.0)
+            for j, param in enumerate(param_list):
+                jac_con_wrt_param[i, j] = derivative_map.get(param, 0.0)
+
+        try:
+            jac_state_wrt_param = np.linalg.solve(jac_con_wrt_state, -jac_con_wrt_param)
+        except np.linalg.LinAlgError as err:
+            raise RuntimeError(
+                "Failed to compute symbolic sensitivities because the Jacobian of "
+                "active equality constraints with respect to state variables is "
+                "singular or ill-conditioned."
+            ) from err
+
+        state_index = {id(var): i for i, var in enumerate(state_vars)}
+        param_index = {id(param): j for j, param in enumerate(param_list)}
+        jac = np.zeros((len(model.experiment_outputs), len(param_list)))
+
+        for i, output in enumerate(model.experiment_outputs.keys()):
+            state_idx = state_index.get(id(output))
+            if state_idx is not None:
+                jac[i, :] = jac_state_wrt_param[state_idx, :]
+                continue
+
+            # Direct parameter outputs carry identity sensitivities; other
+            # outputs outside the implicit state system are locally insensitive.
+            param_idx = param_index.get(id(output))
+            if param_idx is not None:
+                jac[i, param_idx] = 1.0
+
+        for j, param in enumerate(param_list):
+            scale = self.scale_constant_value
+            if self.scale_nominal_param_value:
+                scale *= pyo.value(model.unknown_parameters[param])
+            jac[:, j] *= scale
+
+        return jac, param_list
+
+    def _pynumero_FIM(self, model=None):
+        """Compute the FIM by symbolically differentiating model equations."""
+        if model is None:
+            self.compute_FIM_model = (
+                self.experiment_list[0]
+                .get_labeled_model(**self.get_labeled_model_args)
+                .clone()
+            )
+            model = self.compute_FIM_model
+
+        if not hasattr(model, "objective"):
+            model.objective = pyo.Objective(expr=0, sense=pyo.minimize)
+
+        for comp in model.experiment_inputs:
+            comp.fix()
+
+        try:
+            res = self.solver.solve(model, tee=self.tee)
+            pyo.assert_optimal_termination(res)
+        except Exception as err:
+            raise RuntimeError(
+                "Model from experiment did not solve appropriately. "
+                "Make sure the model is well-posed."
+            ) from err
+
+        self.pynumero_jac, param_list = self._compute_symbolic_sensitivity_matrix(model)
+
+        if self.prior_FIM is None:
+            self.prior_FIM = np.zeros((len(param_list), len(param_list)))
+        else:
+            self.check_model_FIM(FIM=self.prior_FIM)
+
+        cov_y = np.zeros((len(model.measurement_error), len(model.measurement_error)))
+        for i, (_, error) in enumerate(model.measurement_error.items()):
+            cov_y[i, i] = 1 / error**2
+
+        self.pynumero_FIM = (
+            self.pynumero_jac.T @ cov_y @ self.pynumero_jac + self.prior_FIM
+        )
+
     # Create the DoE model (with ``scenarios`` from finite differencing scheme)
     def create_doe_model(
         self, model=None, experiment_index=0, _for_multi_experiment=False
@@ -2281,6 +2530,15 @@ class DesignOfExperiments:
                                variables that will be created at the aggregated level (default: False)
 
         """
+        if self._gradient_method not in self._FINITE_DIFFERENCE_GRADIENTS.union(
+            {GradientMethod.pynumero}
+        ):
+            raise NotImplementedError(
+                "create_doe_model currently supports finite-difference and "
+                "pynumero gradient methods. "
+                f"Received gradient_method='{self._enum_label(self._gradient_method)}'."
+            )
+
         if model is None:
             model = self.model
         else:
@@ -2306,10 +2564,15 @@ class DesignOfExperiments:
                 "if only_compute_fim_lower is True."
             )
 
-        # Generate scenarios for finite difference formulae
-        self._generate_fd_scenario_blocks(
-            model=model, experiment_index=experiment_index
-        )
+        # Generate the model structure needed by the selected gradient method.
+        if self._gradient_method in self._FINITE_DIFFERENCE_GRADIENTS:
+            self._generate_fd_scenario_blocks(
+                model=model, experiment_index=experiment_index
+            )
+        else:
+            self._generate_pynumero_scenario_blocks(
+                model=model, experiment_index=experiment_index
+            )
 
         # Set names for indexing sensitivity matrix (jacobian) and FIM
         scen_block_ind = min(
@@ -2441,48 +2704,203 @@ class DesignOfExperiments:
                             if self.objective_option == ObjectiveLib.trace:
                                 model.L_inv[c, d].setlb(self.L_diagonal_lower_bound)
 
-        # jacobian rule
-        def jacobian_rule(m, n, p):
-            """
-            m: Pyomo model
-            n: experimental output
-            p: unknown parameter
-            """
-            fd_step_mult = 1
-            cuid = pyo.ComponentUID(n)
-            param_ind = m.parameter_names.data().index(p)
+        if self._gradient_method == GradientMethod.pynumero:
+            base_block = model.fd_scenario_blocks[0]
+            parameter_names_list = list(model.parameter_names)
+            output_names_list = list(model.output_names)
 
-            # Different FD schemes lead to different scenarios for the computation
-            if self.fd_formula == FiniteDifferenceStep.central:
-                s1 = param_ind * 2
-                s2 = param_ind * 2 + 1
-                fd_step_mult = 2
-            elif self.fd_formula == FiniteDifferenceStep.forward:
-                s1 = param_ind + 1
-                s2 = 0
-            elif self.fd_formula == FiniteDifferenceStep.backward:
-                s1 = 0
-                s2 = param_ind + 1
-
-            var_up = cuid.find_component_on(m.fd_scenario_blocks[s1])
-            var_lo = cuid.find_component_on(m.fd_scenario_blocks[s2])
-
-            param = m.parameter_scenarios[max(s1, s2)]
-            param_loc = pyo.ComponentUID(param).find_component_on(
-                m.fd_scenario_blocks[0]
-            )
-            param_val = m.fd_scenario_blocks[0].unknown_parameters[param_loc]
-            param_diff = param_val * fd_step_mult * self.step
-
-            if self.scale_nominal_param_value:
-                return (
-                    m.sensitivity_jacobian[n, p]
-                    == (var_up - var_lo)
-                    / param_diff
-                    * param_val
-                    * self.scale_constant_value
+            param_var_by_name = {
+                name: var
+                for name, var in zip(
+                    parameter_names_list, base_block.unknown_parameters.keys()
                 )
-            else:
+            }
+            output_var_by_name = {
+                name: var
+                for name, var in zip(
+                    output_names_list, base_block.experiment_outputs.keys()
+                )
+            }
+
+            input_var_set = ComponentSet(base_block.experiment_inputs.keys())
+            param_var_set = ComponentSet(param_var_by_name.values())
+            con_list = []
+            state_var_set = ComponentSet()
+
+            for con in base_block.component_data_objects(
+                pyo.Constraint, descend_into=True, active=True
+            ):
+                if not con.equality:
+                    continue
+                con_list.append(con)
+                for var in identify_variables(con.body, include_fixed=False):
+                    if var in input_var_set or var in param_var_set:
+                        continue
+                    state_var_set.add(var)
+
+            state_var_list = list(state_var_set)
+            if len(con_list) != len(state_var_list):
+                raise ValueError(
+                    "For gradient_method='pynumero', the model must satisfy a square "
+                    "implicit system per experiment: number of active equality "
+                    "constraints must equal number of state variables "
+                    "(excluding unknown parameters and experiment inputs). "
+                    f"Got {len(con_list)} constraints and {len(state_var_list)} "
+                    "state variables."
+                )
+
+            con_names = [
+                str(pyo.ComponentUID(con, context=base_block)) for con in con_list
+            ]
+            state_names = [
+                str(pyo.ComponentUID(var, context=base_block)) for var in state_var_list
+            ]
+            con_by_name = dict(zip(con_names, con_list))
+            state_var_by_name = dict(zip(state_names, state_var_list))
+            state_name_by_var_id = {
+                id(var): name for name, var in state_var_by_name.items()
+            }
+            param_name_by_var_id = {
+                id(var): name for name, var in param_var_by_name.items()
+            }
+
+            dcdx_expr = {}
+            dcdp_expr = {}
+            jac_con_wrt_state = np.zeros((len(con_list), len(state_var_list)))
+            jac_con_wrt_param = np.zeros((len(con_list), len(parameter_names_list)))
+
+            for con_idx, con_name in enumerate(con_names):
+                con = con_by_name[con_name]
+                symbolic_derivatives = reverse_sd(con.body)
+                numeric_derivatives = reverse_ad(con.body)
+                for state_idx, state_name in enumerate(state_names):
+                    state_var = state_var_by_name[state_name]
+                    dcdx_expr[(con_name, state_name)] = symbolic_derivatives.get(
+                        state_var, 0.0
+                    )
+                    jac_con_wrt_state[con_idx, state_idx] = numeric_derivatives.get(
+                        state_var, 0.0
+                    )
+                for param_idx, param_name in enumerate(parameter_names_list):
+                    param_var = param_var_by_name[param_name]
+                    dcdp_expr[(con_name, param_name)] = symbolic_derivatives.get(
+                        param_var, 0.0
+                    )
+                    jac_con_wrt_param[con_idx, param_idx] = numeric_derivatives.get(
+                        param_var, 0.0
+                    )
+
+            init_state_sens_values = {
+                (state_name, param_name): 0.0
+                for state_name in state_names
+                for param_name in parameter_names_list
+            }
+            if con_names:
+                try:
+                    init_state_sens = np.linalg.solve(
+                        jac_con_wrt_state, -jac_con_wrt_param
+                    )
+                    for state_idx, state_name in enumerate(state_names):
+                        for param_idx, param_name in enumerate(parameter_names_list):
+                            init_state_sens_values[(state_name, param_name)] = (
+                                init_state_sens[state_idx, param_idx]
+                            )
+                except np.linalg.LinAlgError:
+                    # A zero start remains valid; the NLP solver can refine it.
+                    pass
+
+            model.pynumero_constraint_names = pyo.Set(initialize=con_names)
+            model.pynumero_state_var_names = pyo.Set(initialize=state_names)
+
+            def initialize_state_parameter_sens(m, state_name, param_name):
+                return init_state_sens_values[(state_name, param_name)]
+
+            model.state_parameter_sens = pyo.Var(
+                model.pynumero_state_var_names,
+                model.parameter_names,
+                initialize=initialize_state_parameter_sens,
+            )
+
+            def implicit_sensitivity_rule(m, con_name, param_name):
+                return (
+                    sum(
+                        dcdx_expr[(con_name, state_name)]
+                        * m.state_parameter_sens[state_name, param_name]
+                        for state_name in m.pynumero_state_var_names
+                    )
+                    == -dcdp_expr[(con_name, param_name)]
+                )
+
+            model.pynumero_implicit_sensitivity_constraint = pyo.Constraint(
+                model.pynumero_constraint_names,
+                model.parameter_names,
+                rule=implicit_sensitivity_rule,
+            )
+
+            def jacobian_rule(m, output_name, param_name):
+                output_var = output_var_by_name[output_name]
+                scale = self.scale_constant_value
+                if self.scale_nominal_param_value:
+                    scale *= param_var_by_name[param_name]
+
+                state_name = state_name_by_var_id.get(id(output_var))
+                if state_name is not None:
+                    return (
+                        m.sensitivity_jacobian[output_name, param_name]
+                        == m.state_parameter_sens[state_name, param_name] * scale
+                    )
+
+                output_param_name = param_name_by_var_id.get(id(output_var))
+                if output_param_name is not None:
+                    return m.sensitivity_jacobian[output_name, param_name] == (
+                        (1.0 if output_param_name == param_name else 0.0) * scale
+                    )
+
+                return m.sensitivity_jacobian[output_name, param_name] == 0.0
+
+        else:
+
+            # Preserve the existing finite-difference gradient equations.
+            def jacobian_rule(m, n, p):
+                """
+                m: Pyomo model
+                n: experimental output
+                p: unknown parameter
+                """
+                fd_step_mult = 1
+                cuid = pyo.ComponentUID(n)
+                param_ind = m.parameter_names.data().index(p)
+
+                # Different FD schemes lead to different scenarios for the computation
+                if self.fd_formula == FiniteDifferenceStep.central:
+                    s1 = param_ind * 2
+                    s2 = param_ind * 2 + 1
+                    fd_step_mult = 2
+                elif self.fd_formula == FiniteDifferenceStep.forward:
+                    s1 = param_ind + 1
+                    s2 = 0
+                elif self.fd_formula == FiniteDifferenceStep.backward:
+                    s1 = 0
+                    s2 = param_ind + 1
+
+                var_up = cuid.find_component_on(m.fd_scenario_blocks[s1])
+                var_lo = cuid.find_component_on(m.fd_scenario_blocks[s2])
+
+                param = m.parameter_scenarios[max(s1, s2)]
+                param_loc = pyo.ComponentUID(param).find_component_on(
+                    m.fd_scenario_blocks[0]
+                )
+                param_val = m.fd_scenario_blocks[0].unknown_parameters[param_loc]
+                param_diff = param_val * fd_step_mult * self._step_for(p)
+
+                if self.scale_nominal_param_value:
+                    return (
+                        m.sensitivity_jacobian[n, p]
+                        == (var_up - var_lo)
+                        / param_diff
+                        * param_val
+                        * self.scale_constant_value
+                    )
                 return (
                     m.sensitivity_jacobian[n, p]
                     == (var_up - var_lo) / param_diff * self.scale_constant_value
@@ -2701,16 +3119,15 @@ class DesignOfExperiments:
                     return
 
             param = parent_block.parameter_scenarios[s]
+            step = self._step_for(param.local_name)
 
             # Perturbation to be (1 + diff) * param_value
             if self.fd_formula == FiniteDifferenceStep.central:
-                diff = self.step * (
-                    (-1) ** s
-                )  # Positive perturbation, even; negative, odd
+                diff = step * ((-1) ** s)  # Positive perturbation, even; negative, odd
             elif self.fd_formula == FiniteDifferenceStep.backward:
-                diff = self.step * -1  # Backward always negative perturbation
+                diff = step * -1  # Backward always negative perturbation
             elif self.fd_formula == FiniteDifferenceStep.forward:
-                diff = self.step  # Forward always positive
+                diff = step  # Forward always positive
             else:
                 # TODO: add an error message for this as not being implemented yet
                 diff = 0
@@ -2762,6 +3179,81 @@ class DesignOfExperiments:
         model.del_component(model.base_model)
 
         # TODO: consider this logic? Multi-block systems need something more fancy
+        self._built_scenarios = True
+
+    def _generate_pynumero_scenario_blocks(self, model=None, experiment_index=0):
+        """
+        Generate one model block for symbolic sensitivity computations.
+
+        The block retains the finite-difference container name so the existing
+        FIM, objective, and multi-experiment aggregation paths can be reused.
+        """
+        if model is None:
+            model = self.model
+
+        model.base_model = (
+            self.experiment_list[experiment_index]
+            .get_labeled_model(**self.get_labeled_model_args)
+            .clone()
+        )
+
+        self.check_model_labels(model=model.base_model)
+
+        self.n_parameters = len(model.base_model.unknown_parameters)
+        self.n_measurement_error = len(model.base_model.measurement_error)
+        self.n_experiment_inputs = len(model.base_model.experiment_inputs)
+        self.n_experiment_outputs = len(model.base_model.experiment_outputs)
+
+        if self.n_measurement_error != self.n_experiment_outputs:
+            raise ValueError(
+                "Number of experiment outputs, {}, and length of measurement error, "
+                "{}, do not match. Please check model labeling.".format(
+                    self.n_experiment_outputs, self.n_measurement_error
+                )
+            )
+
+        self.logger.info("Experiment output and measurement error lengths match.")
+
+        if self.prior_FIM is not None:
+            self.check_model_FIM(FIM=self.prior_FIM)
+        else:
+            self.prior_FIM = np.zeros((self.n_parameters, self.n_parameters))
+        if self.fim_initial is not None:
+            self.check_model_FIM(FIM=self.fim_initial)
+        else:
+            self.fim_initial = np.eye(self.n_parameters) + self.prior_FIM
+        if self.jac_initial is not None:
+            self.check_model_jac(self.jac_initial)
+        else:
+            self.jac_initial = np.eye(self.n_experiment_outputs, self.n_parameters)
+
+        # Initialize the state at the nominal design before embedding symbolic
+        # derivatives in the optimization model.
+        for comp in model.base_model.experiment_inputs:
+            comp.fix()
+        try:
+            res = self.solver.solve(model.base_model, tee=self.tee)
+            pyo.assert_optimal_termination(res)
+            self.logger.info("Model from experiment solved.")
+        except Exception as err:
+            raise RuntimeError(
+                "Model from experiment did not solve appropriately. "
+                "Make sure the model is well-posed."
+            ) from err
+        for comp in model.base_model.experiment_inputs:
+            comp.unfix()
+
+        model.scenarios = range(1)
+
+        def build_block_scenarios(block, _scenario):
+            parent_block = block.parent_block()
+            block.transfer_attributes_from(parent_block.base_model.clone())
+
+        model.fd_scenario_blocks = pyo.Block(
+            model.scenarios, rule=build_block_scenarios
+        )
+
+        model.del_component(model.base_model)
         self._built_scenarios = True
 
     # Create objective function

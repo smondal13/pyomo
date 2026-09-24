@@ -39,6 +39,10 @@ if scipy_available:
         ReactorExperiment as FullReactorExperiment,
         run_reactor_doe,
     )
+    from pyomo.contrib.doe.examples.polynomial import (
+        PolynomialExperiment,
+        run_polynomial_doe,
+    )
     from pyomo.contrib.doe.tests.experiment_class_example_flags import (
         RooneyBieglerExperimentBad,
         RooneyBieglerMultiExperiment,
@@ -161,6 +165,51 @@ def get_standard_args(experiment, fd_method, obj_used):
     args['_Cholesky_option'] = True
     args['_only_compute_fim_lower'] = True
     return args
+
+
+@unittest.skipIf(not ipopt_available, "The 'ipopt' command is not available")
+@unittest.skipIf(not numpy_available, "Numpy is not available")
+class TestSymbolicDifferentiation(unittest.TestCase):
+    def test_pynumero_fim_matches_analytic_polynomial(self):
+        doe_obj = DesignOfExperiments(
+            experiment=[PolynomialExperiment(x1=2.0, x2=3.0)],
+            gradient_method="pynumero",
+            objective_option="determinant",
+            solver=SolverFactory("ipopt"),
+        )
+
+        fim = doe_obj.compute_FIM()
+        expected_jac = np.array([[2.0, 3.0, 6.0, 1.0]])
+
+        self.assertTrue(np.allclose(doe_obj.pynumero_jac, expected_jac, atol=1e-8))
+        self.assertTrue(np.allclose(fim, expected_jac.T @ expected_jac, atol=1e-8))
+
+    def test_pynumero_fim_aggregates_multiple_experiments(self):
+        experiments = [
+            PolynomialExperiment(x1=2.0, x2=3.0),
+            PolynomialExperiment(x1=1.0, x2=4.0),
+        ]
+        prior = np.eye(4)
+        doe_obj = DesignOfExperiments(
+            experiment=experiments,
+            gradient_method="pynumero",
+            objective_option="determinant",
+            prior_FIM=prior,
+            solver=SolverFactory("ipopt"),
+        )
+
+        fim = doe_obj.compute_FIM()
+        jac_1 = np.array([[2.0, 3.0, 6.0, 1.0]])
+        jac_2 = np.array([[1.0, 4.0, 4.0, 1.0]])
+        expected = jac_1.T @ jac_1 + jac_2.T @ jac_2 + prior
+
+        self.assertTrue(np.allclose(fim, expected, atol=1e-8))
+
+    def test_run_polynomial_doe_example(self):
+        fim = run_polynomial_doe(solver=SolverFactory("ipopt"))
+        expected_jac = np.array([[1.0, 1.0, 1.0, 1.0]])
+
+        self.assertTrue(np.allclose(fim, expected_jac.T @ expected_jac, atol=1e-8))
 
 
 @unittest.skipIf(not ipopt_available, "The 'ipopt' command is not available")
@@ -1007,6 +1056,24 @@ class TestOptimizeExperimentsAlgorithm(unittest.TestCase):
                 return _stub_results()
 
         return _SquareSolveThenStubSolver(real_solver)
+
+    def test_optimize_experiments_with_pynumero_gradients(self):
+        experiment = RooneyBieglerMultiExperiment(hour=2.0, y=10.0)
+        doe_obj = DesignOfExperiments(
+            experiment=[experiment],
+            objective_option="pseudo_trace",
+            step=1e-2,
+            solver=SolverFactory("ipopt"),
+            gradient_method="pynumero",
+        )
+
+        doe_obj.optimize_experiments(n_exp=2, init_method=None)
+
+        self.assertEqual(doe_obj.results["problem"]["gradient_method"], "pynumero")
+        self.assertIsNone(doe_obj.results["problem"]["finite_difference_scheme"])
+        self.assertEqual(
+            doe_obj.results["problem"]["number_of_experiments_per_scenario"], 2
+        )
 
     def test_evaluate_objective_from_fim_numerical_values(self):
         fim = np.array([[4.0, 1.0], [1.0, 3.0]])

@@ -23,7 +23,7 @@ import pyomo.common.unittest as unittest
 if not (numpy_available and scipy_available):
     raise unittest.SkipTest("Pyomo.DoE needs scipy and numpy to run tests")
 
-from pyomo.contrib.doe import DesignOfExperiments
+from pyomo.contrib.doe import DesignOfExperiments, GradientMethod
 import pyomo.contrib.doe.doe as doe_module
 from pyomo.contrib.doe.doe import InitializationMethod, _DoEResultsJSONEncoder
 from pyomo.contrib.doe.tests.experiment_class_example_flags import (
@@ -117,6 +117,27 @@ class TestDoEErrors(unittest.TestCase):
             "The 'experiment' argument is required and cannot be an empty list",
         ):
             DesignOfExperiments(experiment=[], objective_option="pseudo_trace")
+
+    def test_gradient_method_forward_aliases_fd_formula(self):
+        doe_obj = DesignOfExperiments(
+            experiment=[_DummyExperiment()],
+            gradient_method="forward",
+            objective_option="pseudo_trace",
+        )
+        self.assertEqual(doe_obj._gradient_method, GradientMethod.forward)
+        self.assertEqual(doe_obj.fd_formula, doe_module.FiniteDifferenceStep.forward)
+
+    def test_optimize_experiments_kaug_not_supported(self):
+        doe_obj = DesignOfExperiments(
+            experiment=[_DummyExperiment()],
+            gradient_method="kaug",
+            objective_option="pseudo_trace",
+        )
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "optimize_experiments currently supports finite-difference and pynumero",
+        ):
+            doe_obj.optimize_experiments(n_exp=1)
 
     def test_doe_results_json_encoder_unsupported_object_raises(self):
         with self.assertRaises(TypeError):
@@ -776,9 +797,8 @@ class TestDoEErrors(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            "The method provided, {}, must be either `sequential` or `kaug`".format(
-                "Bad Method"
-            ),
+            "The method provided, Bad Method, must be one of `sequential`, "
+            "`kaug`, or `pynumero`",
         ):
             doe_obj.compute_FIM(method="Bad Method")
 

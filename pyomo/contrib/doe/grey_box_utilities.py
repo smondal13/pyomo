@@ -136,6 +136,12 @@ class FIMExternalGreyBox(
         )
         self._n_inputs = len(self._input_values)
 
+        # Multiplier of the (single) output constraint, set by the solver
+        # through set_output_constraint_multipliers(). Defaults to 1 so that
+        # calling evaluate_hessian_outputs() directly returns the bare
+        # Hessian of the output.
+        self._output_con_mult_values = np.ones(1, dtype=np.float64)
+
     def _get_FIM(self):
         # Grabs the current FIM subject
         # to the input values.
@@ -859,8 +865,18 @@ class FIMExternalGreyBox(
         else:
             ObjectiveLib(self.objective_option)
 
+        # ExternalGreyBoxModel's contract is that this returns the Hessian of
+        # the outputs weighted by the output constraint multipliers,
+        # sum_i y_i * hess(w_i). There is a single output here, so scale by
+        # y. Without this, the Lagrangian Hessian passed to the solver is
+        # correct only when y == 1 (wrong sign for maximized objectives,
+        # where y -> -1 at a solution).
+        hess_vals = np.asarray(hess_vals, dtype=np.float64) * (
+            self._output_con_mult_values[0]
+        )
+
         # Returns coo_matrix of the correct shape
         return scipy.sparse.coo_matrix(
-            (np.asarray(hess_vals), (hess_rows, hess_cols)),
+            (hess_vals, (hess_rows, hess_cols)),
             shape=(self._n_inputs, self._n_inputs),
         )

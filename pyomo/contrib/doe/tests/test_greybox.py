@@ -996,6 +996,33 @@ class TestFIMExternalGreyBox(unittest.TestCase):
         # assert that each component is close
         self.assertTrue(np.all(np.isclose(hess_gb, hess_FD, rtol=1e-4, atol=1e-4)))
 
+    def test_hessian_outputs_scale_with_output_multiplier(self):
+        """evaluate_hessian_outputs must return y * hess(w), per the
+        ExternalGreyBoxModel contract, where y is the multiplier passed to
+        set_output_constraint_multipliers (default 1)."""
+        for objective_option in (
+            "trace",
+            "pseudo_trace",
+            "determinant",
+            "minimum_eigenvalue",
+            "condition_number",
+        ):
+            with self.subTest(objective_option=objective_option):
+                doe_obj, grey_box_object = make_greybox_and_doe_objects(
+                    objective_option=objective_option
+                )
+                grey_box_object.set_input_values(testing_matrix[masking_matrix > 0])
+
+                hess_default = grey_box_object.evaluate_hessian_outputs().toarray()
+
+                grey_box_object.set_output_constraint_multipliers(np.array([1.0]))
+                hess_one = grey_box_object.evaluate_hessian_outputs().toarray()
+                self.assertTrue(np.allclose(hess_default, hess_one))
+
+                grey_box_object.set_output_constraint_multipliers(np.array([-2.5]))
+                hess_scaled = grey_box_object.evaluate_hessian_outputs().toarray()
+                self.assertTrue(np.allclose(hess_scaled, -2.5 * hess_one))
+
     def test_equality_constraint_names(self):
         """Confirm the FIM grey-box objective exposes no equality constraints."""
         objective_option = "condition_number"
