@@ -69,6 +69,7 @@ class ObjectiveLib(Enum):
     trace = "trace"  # trace(inv(FIM)), A-optimality
     pseudo_trace = "pseudo_trace"  # trace(FIM), pseudo-A-optimality
     minimum_eigenvalue = "minimum_eigenvalue"  # min(eig(FIM)), E-optimality
+    log_minimum_eigenvalue = "log_minimum_eigenvalue"  # log-E-optimality
     condition_number = "condition_number"  # cond(FIM), ME-optimality
     zero = "zero"  # Constant zero objective, useful for initialization and debugging
 
@@ -104,6 +105,13 @@ class _DoEResultsJSONEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+class GreyBoxFIMFormulation(Enum):
+    """Select the matrix passed to the GreyBox objective."""
+
+    fim = "fim"
+    sensitivity = "sensitivity"
+
+
 class DesignOfExperiments:
     # Objective options whose scalar score is compared with "larger is better"
     # in initialization and diagnostics paths.
@@ -112,6 +120,7 @@ class DesignOfExperiments:
             ObjectiveLib.determinant,
             ObjectiveLib.pseudo_trace,
             ObjectiveLib.minimum_eigenvalue,
+            ObjectiveLib.log_minimum_eigenvalue,
         }
     )
     _FINITE_DIFFERENCE_GRADIENTS = frozenset(
@@ -141,6 +150,8 @@ class DesignOfExperiments:
         _Cholesky_option=True,
         _only_compute_fim_lower=True,
         gradient_method=None,
+        grey_box_fim_formulation="fim",
+        grey_box_eigenvalue_reference=1.0,
     ):
         """This package enables model-based design of experiments analysis
         with Pyomo.  Both direct optimization and enumeration modes are
@@ -190,15 +201,26 @@ class DesignOfExperiments:
             - ``determinant`` (for determinant, or D-optimality),
             - ``trace`` (for trace of covariance matrix, or A-optimality),
             - ``pseudo_trace`` (for trace of Fisher Information Matrix(FIM), or pseudo A-optimality),
-            - ``minimum_eigenvalue``, (for E-optimality), or
+            - ``minimum_eigenvalue`` (for E-optimality),
+            - ``log_minimum_eigenvalue`` (for natural-log E-optimality), or
             - ``condition_number`` (for ME-optimality)
             Note: E-optimality and ME-optimality are only supported when using the
-            grey box objective (i.e., ``grey_box_solver`` is True)
+            grey box objective (i.e., ``use_grey_box_objective`` is True)
             default: ``determinant``
         use_grey_box_objective:
             Boolean of whether or not to use the grey-box version of the objective
             function. True to use grey box, False to use standard.
             Default: False (do not use grey box)
+        grey_box_fim_formulation:
+            ``fim`` passes the upper triangle of the lifted FIM (default).
+            ``sensitivity`` passes the sensitivity Jacobian and constructs
+            ``J.T @ W @ J + prior_FIM`` inside the GreyBox. Requires
+            ``use_grey_box_objective=True``. A positive-semidefinite prior is
+            required; positive definiteness also requires sufficient information
+            from the prior or Jacobian.
+        grey_box_eigenvalue_reference:
+            Finite positive reference for ``log_minimum_eigenvalue``, which
+            maximizes ``log(lambda_min(FIM) / reference)``. Default: 1.
         scale_constant_value:
             Constant scaling for the sensitivity matrix. Every element will be
             multiplied by this scaling factor.
@@ -304,6 +326,22 @@ class DesignOfExperiments:
         # Set the objective type and scaling options:
         self.objective_option = ObjectiveLib(objective_option)
         self.use_grey_box = use_grey_box_objective
+        self.grey_box_fim_formulation = GreyBoxFIMFormulation(grey_box_fim_formulation)
+        self.grey_box_eigenvalue_reference = float(grey_box_eigenvalue_reference)
+        if (
+            not math.isfinite(self.grey_box_eigenvalue_reference)
+            or self.grey_box_eigenvalue_reference <= 0
+        ):
+            raise ValueError(
+                "grey_box_eigenvalue_reference must be finite and positive."
+            )
+        if not self.use_grey_box and (
+            self.grey_box_fim_formulation == GreyBoxFIMFormulation.sensitivity
+            or self.objective_option == ObjectiveLib.log_minimum_eigenvalue
+        ):
+            raise ValueError(
+                "The sensitivity FIM formulation and log_minimum_eigenvalue require use_grey_box_objective=True."
+            )
 
         self.scale_constant_value = scale_constant_value
         self.scale_nominal_param_value = scale_nominal_param_value
@@ -385,12 +423,14 @@ class DesignOfExperiments:
             return "log-D-opt"
         if self.objective_option == ObjectiveLib.minimum_eigenvalue:
             return "E-opt"
+        if self.objective_option == ObjectiveLib.log_minimum_eigenvalue:
+            return "log-E-opt"
         if self.objective_option == ObjectiveLib.condition_number:
             return "ME-opt"
         raise ValueError(
             "Grey-box objective support is only available for "
             "objective_option in ['determinant', 'trace', 'pseudo_trace', "
-            "'minimum_eigenvalue', 'condition_number']."
+            "'minimum_eigenvalue', 'log_minimum_eigenvalue', 'condition_number']."
         )
 
     def _initialize_grey_box_block(self, egb_block, fim_np, parameter_names):
@@ -423,6 +463,10 @@ class DesignOfExperiments:
             output_value = np.log(np.linalg.det(fim_np))
         elif self.objective_option == ObjectiveLib.minimum_eigenvalue:
             output_value = np.min(np.linalg.eigvalsh(fim_np))
+        elif self.objective_option == ObjectiveLib.log_minimum_eigenvalue:
+            output_value = np.log(np.min(np.linalg.eigvalsh(fim_np))) - np.log(
+                self.grey_box_eigenvalue_reference
+            )
         elif self.objective_option == ObjectiveLib.condition_number:
             eig = np.linalg.eigvalsh(fim_np)
             output_value = np.log(np.abs(np.max(eig) / np.min(eig)))
@@ -430,6 +474,74 @@ class DesignOfExperiments:
             output_value = 0.0
 
         egb_block.outputs[self._grey_box_output_name()].set_value(float(output_value))
+
+    def _sensitivity_measurement_weights(self, model):
+        """
+        Return ``1 / sigma_i**2`` for every entry of ``model.output_names``.
+
+        The measurement errors are read from the nominal finite-difference
+        scenario block, in the same order as the rows of
+        ``model.sensitivity_jacobian``.
+        """
+        scenario = model.fd_scenario_blocks[0]
+        errors = np.asarray(
+            [
+                float(
+                    scenario.measurement_error[
+                        pyo.ComponentUID(name).find_component_on(scenario)
+                    ]
+                )
+                for name in model.output_names
+            ],
+            dtype=np.float64,
+        )
+        return 1.0 / errors**2
+
+    def _fim_from_sensitivity(self, model):
+        """
+        Reconstruct ``J.T @ W @ J + prior_FIM`` from the current values of
+        ``model.sensitivity_jacobian``. This is the matrix the sensitivity
+        GreyBox formulation scores, and the reporting FIM in that mode.
+        """
+        sensitivity = np.asarray(self.get_sensitivity_matrix(model), dtype=np.float64)
+        weights = self._sensitivity_measurement_weights(model)
+        return sensitivity.T @ (weights[:, None] * sensitivity) + np.asarray(
+            self.prior_FIM, dtype=np.float64
+        )
+
+    def _sync_fim_from_sensitivity(self, model):
+        """
+        Copy the reconstructed FIM into the (inactive) lifted ``model.fim``
+        variables so that ``_get_fim_numpy`` and every results/quality-metric
+        path see the same matrix the GreyBox objective scored. Returns the
+        dense reconstructed FIM.
+        """
+        fim_np = self._fim_from_sensitivity(model)
+        for i, p in enumerate(model.parameter_names):
+            for j, q in enumerate(model.parameter_names):
+                if model.fim[p, q].fixed:
+                    # Upper triangle is fixed at zero in only_compute_fim_lower mode.
+                    continue
+                model.fim[p, q].set_value(fim_np[i, j])
+        return fim_np
+
+    def _initialize_sensitivity_grey_box_block(self, model):
+        """
+        Seed a sensitivity-input grey box block from the current values of
+        ``model.sensitivity_jacobian`` and evaluate its output once so the
+        final NLP solve starts from a consistent external state.
+        """
+        egb_block = model.obj_cons.egb_fim_block
+        external = egb_block.get_external_model()
+        values = []
+        for output, parameter in external.input_names():
+            value = pyo.value(model.sensitivity_jacobian[output, parameter])
+            egb_block.inputs[output, parameter].set_value(value)
+            values.append(value)
+        external.set_input_values(np.asarray(values, dtype=np.float64))
+        egb_block.outputs[self._grey_box_output_name()].set_value(
+            float(external.evaluate_outputs()[0])
+        )
 
     def _initialize_standard_objective_block(self, block, fim_np, parameter_names):
         """
@@ -594,15 +706,25 @@ class DesignOfExperiments:
         fim_np = self._get_fim_numpy(model)
 
         if self.use_grey_box:
-            self._initialize_grey_box_block(
-                model.obj_cons.egb_fim_block, fim_np, model.parameter_names
-            )
+            if self.grey_box_fim_formulation == GreyBoxFIMFormulation.sensitivity:
+                # The lifted FIM equations are inactive in this mode: seed the
+                # external model from the current sensitivity values and keep
+                # ``model.fim`` synchronized with the reconstructed J^T W J + P
+                # so that every reporting path reads the same matrix.
+                fim_np = self._sync_fim_from_sensitivity(model)
+                self._initialize_sensitivity_grey_box_block(model)
+            else:
+                self._initialize_grey_box_block(
+                    model.obj_cons.egb_fim_block, fim_np, model.parameter_names
+                )
 
         self._initialize_standard_objective_block(model, fim_np, model.parameter_names)
 
         # Solve the full model, which has now been initialized with the square solve
         if self.use_grey_box:
             res = self.grey_box_solver.solve(model, tee=self.grey_box_tee)
+            if self.grey_box_fim_formulation == GreyBoxFIMFormulation.sensitivity:
+                self._sync_fim_from_sensitivity(model)
         else:
             res = self.solver.solve(model, tee=self.tee)
 
@@ -687,6 +809,14 @@ class DesignOfExperiments:
             self.step if self.fd_formula is not None else None
         )
         self.results["Nominal Parameter Scaling"] = self.scale_nominal_param_value
+        if self.use_grey_box:
+            self.results["GreyBox FIM Formulation"] = (
+                self.grey_box_fim_formulation.value
+            )
+            if self.objective_option == ObjectiveLib.log_minimum_eigenvalue:
+                self.results["GreyBox Eigenvalue Reference"] = (
+                    self.grey_box_eigenvalue_reference
+                )
 
         # TODO: Add more useful fields to the results object?
         # TODO: Add MetaData from the user to the results object? Or leave to the user?
@@ -4121,13 +4251,39 @@ class DesignOfExperiments:
         # TODO: Make this naming convention robust
         model.obj_cons = pyo.Block()
 
+        # In the sensitivity formulation the external model receives J instead
+        # of the FIM, so seed it from the current Jacobian values on this block
+        # (mirroring how ``fim_initial`` was just read from ``fim_expr``).
+        sensitivity_kwargs = {}
+        if self.grey_box_fim_formulation == GreyBoxFIMFormulation.sensitivity:
+            measurement_names = list(model.output_names)
+            sensitivity_kwargs = dict(
+                measurement_names=measurement_names,
+                jac_initial=np.array(
+                    [
+                        [
+                            pyo.value(model.sensitivity_jacobian[n, p])
+                            for p in parameter_names
+                        ]
+                        for n in measurement_names
+                    ],
+                    dtype=np.float64,
+                ),
+                measurement_errors=1.0
+                / np.sqrt(self._sensitivity_measurement_weights(model)),
+                prior_FIM=self.prior_FIM,
+            )
+
         # Create FIM External Grey Box object
         grey_box_FIM = FIMExternalGreyBox(
             doe_object=self,
             parameter_names=parameter_names,
             fim_initial=fim_initial,
             objective_option=self.objective_option,
+            fim_formulation=self.grey_box_fim_formulation,
+            eigenvalue_reference=self.grey_box_eigenvalue_reference,
             logger_level=self.logger.getEffectiveLevel(),
+            **sensitivity_kwargs,
         )
 
         # Attach External Grey Box Model
@@ -4152,27 +4308,42 @@ class DesignOfExperiments:
             else:
                 return pyo.Constraint.Skip
 
-        # Add the FIM and External Grey
-        # Box inputs constraints
-        model.obj_cons.FIM_equalities = pyo.Constraint(
-            parameter_names, parameter_names, rule=FIM_egb_cons
-        )
+        if self.grey_box_fim_formulation == GreyBoxFIMFormulation.sensitivity:
+            if fim_expr is not getattr(model, "fim", None) or not (
+                hasattr(model, "sensitivity_jacobian")
+                and hasattr(model, "fim_constraint")
+            ):
+                raise NotImplementedError(
+                    "grey_box_fim_formulation='sensitivity' is only implemented "
+                    "for the single-experiment run_doe() path, where "
+                    "``sensitivity_jacobian`` and ``fim_constraint`` live on the "
+                    "same block as ``fim``. The multi-experiment "
+                    "optimize_experiments() path aggregates several FIMs and "
+                    "must use grey_box_fim_formulation='fim'."
+                )
+            # FIM entries are reconstructed from J inside the external model.
+            # Exclude the lifted FIM equations from the solver problem.
+            model.fim_constraint.deactivate()
+
+            def sensitivity_egb_cons(m, output, parameter):
+                return (
+                    model.sensitivity_jacobian[output, parameter]
+                    == m.egb_fim_block.inputs[output, parameter]
+                )
+
+            model.obj_cons.sensitivity_equalities = pyo.Constraint(
+                model.output_names, parameter_names, rule=sensitivity_egb_cons
+            )
+        else:
+            # Add the FIM and External Grey
+            # Box inputs constraints
+            model.obj_cons.FIM_equalities = pyo.Constraint(
+                parameter_names, parameter_names, rule=FIM_egb_cons
+            )
 
         if build_objective:
-            if self.objective_option == ObjectiveLib.trace:
-                output_name = "A-opt"
-            elif self.objective_option == ObjectiveLib.pseudo_trace:
-                output_name = "pseudo-A-opt"
-            elif self.objective_option == ObjectiveLib.determinant:
-                output_name = "log-D-opt"
-            elif self.objective_option == ObjectiveLib.minimum_eigenvalue:
-                output_name = "E-opt"
-            elif self.objective_option == ObjectiveLib.condition_number:
-                output_name = "ME-opt"
-            else:
-                # Error path is intentionally deferred to the external model.
-                output_name = "A-opt"
-
+            # ``output_name`` was resolved by _grey_box_output_name() above and
+            # already covers every supported objective (including log-E).
             model.objective = pyo.Objective(
                 expr=model.obj_cons.egb_fim_block.outputs[output_name],
                 sense=(
@@ -5108,6 +5279,13 @@ class DesignOfExperiments:
         """
         if model is None:
             model = self.model
+
+        if (
+            self.use_grey_box
+            and self.grey_box_fim_formulation == GreyBoxFIMFormulation.sensitivity
+            and hasattr(model, "sensitivity_jacobian")
+        ):
+            return self._fim_from_sensitivity(model).tolist()
 
         if not hasattr(model, "fim"):
             raise RuntimeError(

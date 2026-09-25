@@ -31,7 +31,6 @@ from pyomo.common.dependencies import (
     scipy_available,
 )
 
-from enum import Enum
 import itertools
 import logging
 
@@ -51,6 +50,12 @@ class FIMExternalGreyBox(
         logger_level=None,
         parameter_names=None,
         fim_initial=None,
+        fim_formulation="fim",
+        eigenvalue_reference=1.0,
+        measurement_names=None,
+        jac_initial=None,
+        measurement_errors=None,
+        prior_FIM=None,
     ):
         """
         Grey box model for metrics on the FIM. This methodology reduces
@@ -64,12 +69,19 @@ class FIMExternalGreyBox(
            (with sensitivity matrix, Q, and fisher information matrix, FIM).
            The external grey box model will utilize elements of the
            `doe_object` model to build the FIM metric with consistent naming.
-        obj_option:
+        objective_option:
            String representation of the objective option. Current available
            options are: ``determinant`` (D-optimality), ``trace`` (A-optimality),
-           ``minimum_eigenvalue`` (E-optimality), ``condition_number``
+           ``minimum_eigenvalue`` (E-optimality), ``log_minimum_eigenvalue``
+           (natural-log E-optimality), ``condition_number``
            (modified E-optimality).
            default: ``determinant``
+        fim_formulation:
+           ``fim`` passes the upper triangle of the information matrix (default).
+           ``sensitivity`` passes the measurement-by-parameter Jacobian and
+           constructs ``J.T @ W @ J + prior_FIM`` internally.
+        eigenvalue_reference:
+           Finite positive reference for ``log_minimum_eigenvalue``. Default: 1.
         logger_level:
            logging level to be specified if different from doe_object's logging level.
            default: None, or equivalently, use the logging level of doe_object.
@@ -87,6 +99,14 @@ class FIMExternalGreyBox(
         fim_initial:
            Optional dense, symmetric FIM used to seed the grey box inputs. This
            is required when ``doe_object`` is not provided.
+        measurement_names, jac_initial, measurement_errors, prior_FIM:
+           Data for ``fim_formulation="sensitivity"``: the ordered measurement
+           labels (rows of J), the initial measurement-by-parameter Jacobian,
+           the measurement standard deviations in the same order, and the
+           prior FIM. Any of them left as None is read from ``doe_object``
+           (``doe_object.model.output_names``, ``doe_object.jac_initial``,
+           ``doe_object.model.fd_scenario_blocks[0].measurement_error`` and
+           ``doe_object.prior_FIM`` respectively).
         """
 
         if doe_object is None and (parameter_names is None or fim_initial is None):
@@ -105,6 +125,16 @@ class FIMExternalGreyBox(
             parameter_names = self.doe_object.model.parameter_names
         self._param_names = [i for i in parameter_names]
         self._n_params = len(self._param_names)
+
+        from pyomo.contrib.doe import GreyBoxFIMFormulation
+
+        self.fim_formulation = GreyBoxFIMFormulation(fim_formulation).value
+        self.eigenvalue_reference = float(eigenvalue_reference)
+        if not np.isfinite(self.eigenvalue_reference) or self.eigenvalue_reference <= 0:
+            raise ValueError("eigenvalue_reference must be finite and positive.")
+        self._fim_input_names = list(
+            itertools.combinations_with_replacement(self._param_names, 2)
+        )
 
         # Check if the doe_object has model components that are required
         # TODO: is this check necessary?
@@ -131,9 +161,71 @@ class FIMExternalGreyBox(
         fim_initial = np.asarray(fim_initial, dtype=np.float64)
 
         self._masking_matrix = np.triu(np.ones_like(fim_initial))
-        self._input_values = np.asarray(
-            fim_initial[self._masking_matrix > 0], dtype=np.float64
-        )
+        if self.fim_formulation == "sensitivity":
+            # Explicit arguments win; otherwise fall back to the doe_object,
+            # which must then already own the built DoE model.
+            if measurement_names is None:
+                measurement_names = self.doe_object.model.output_names
+            self._measurement_names = [i for i in measurement_names]
+            if jac_initial is None:
+                jac_initial = (
+                    None if self.doe_object is None else self.doe_object.jac_initial
+                )
+            if jac_initial is None:
+                raise ValueError(
+                    "jac_initial is required for the sensitivity GreyBox formulation."
+                )
+            jac_initial = np.asarray(jac_initial, dtype=np.float64)
+            expected_shape = (len(self._measurement_names), self._n_params)
+            if jac_initial.shape != expected_shape:
+                raise ValueError(
+                    "jac_initial has shape %s; expected %s for the sensitivity "
+                    "GreyBox formulation." % (jac_initial.shape, expected_shape)
+                )
+            self._input_values = jac_initial.flatten()
+            if prior_FIM is None:
+                prior_FIM = self.doe_object.prior_FIM
+            self._prior_FIM = np.asarray(prior_FIM, dtype=np.float64)
+            if measurement_errors is None:
+                scenario = self.doe_object.model.fd_scenario_blocks[0]
+                measurement_errors = [
+                    float(
+                        scenario.measurement_error[
+                            pyo.ComponentUID(name).find_component_on(scenario)
+                        ]
+                    )
+                    for name in self._measurement_names
+                ]
+            errors = np.asarray(measurement_errors, dtype=np.float64)
+            if errors.shape != (len(self._measurement_names),):
+                raise ValueError(
+                    "measurement_errors must provide one value per measurement."
+                )
+            if not np.isfinite(errors).all() or np.any(errors <= 0):
+                raise ValueError(
+                    "The sensitivity formulation requires finite positive measurement errors."
+                )
+            self._measurement_weights = 1.0 / errors**2
+        else:
+            self._input_values = np.asarray(
+                fim_initial[self._masking_matrix > 0], dtype=np.float64
+            )
+        if self.fim_formulation == "sensitivity":
+            prior = self._prior_FIM
+            if (
+                prior.shape != (self._n_params, self._n_params)
+                or not np.isfinite(prior).all()
+                or not np.allclose(prior, prior.T, rtol=0, atol=1e-12)
+            ):
+                raise ValueError(
+                    "The sensitivity formulation requires a finite symmetric prior FIM."
+                )
+            if np.linalg.eigvalsh(prior)[0] < -1e-12 * max(
+                1.0, np.linalg.norm(prior, 2)
+            ):
+                raise ValueError(
+                    "The sensitivity formulation requires a positive-semidefinite prior FIM."
+                )
         self._n_inputs = len(self._input_values)
 
         # The solver updates this value before requesting the Hessian of the
@@ -142,6 +234,15 @@ class FIMExternalGreyBox(
         self._output_con_mult_values = np.ones(self.n_outputs(), dtype=np.float64)
 
     def _get_FIM(self):
+        if self.fim_formulation == "sensitivity":
+            sensitivity = self._input_values.reshape(
+                len(self._measurement_names), self._n_params
+            )
+            return (
+                sensitivity.T @ (self._measurement_weights[:, None] * sensitivity)
+                + self._prior_FIM
+            )
+
         # Grabs the current FIM subject
         # to the input values.
         # Inputs store one triangular half
@@ -152,7 +253,7 @@ class FIMExternalGreyBox(
         upt_FIM = self._input_values
 
         # Create FIM in the correct way
-        current_FIM = np.zeros_like(self.doe_object.fim_initial)
+        current_FIM = np.zeros((self._n_params, self._n_params), dtype=np.float64)
         # Utilize upper triangular portion of FIM
         current_FIM[np.triu_indices_from(current_FIM)] = upt_FIM
         # Construct lower triangular using the
@@ -184,10 +285,9 @@ class FIMExternalGreyBox(
         # Cartesian product gives us matrix indices flattened in row-first format
         # Can use itertools.combinations(self._param_names, 2) with added
         # diagonal elements, or do double for loops if we switch to upper triangular
-        input_names_list = list(
-            itertools.combinations_with_replacement(self._param_names, 2)
-        )
-        return input_names_list
+        if self.fim_formulation == "sensitivity":
+            return list(itertools.product(self._measurement_names, self._param_names))
+        return self._fim_input_names
 
     def equality_constraint_names(self):
         # TODO: Are there any objectives that will have constraints?
@@ -208,6 +308,8 @@ class FIMExternalGreyBox(
             obj_name = "log-D-opt"
         elif self.objective_option == ObjectiveLib.minimum_eigenvalue:
             obj_name = "E-opt"
+        elif self.objective_option == ObjectiveLib.log_minimum_eigenvalue:
+            obj_name = "log-E-opt"
         elif self.objective_option == ObjectiveLib.condition_number:
             obj_name = "ME-opt"
         else:
@@ -245,8 +347,15 @@ class FIMExternalGreyBox(
             # M is symmetric by construction (see _get_FIM), so use
             # eigvalsh to guarantee a real dtype (eig can return complex
             # eigenvalues due to floating-point asymmetry noise).
-            eig = np.linalg.eigvalsh(M)
-            obj_value = np.min(eig)
+            obj_value = np.linalg.eigvalsh(M)[0]
+        elif self.objective_option == ObjectiveLib.log_minimum_eigenvalue:
+            minimum_eigenvalue = np.linalg.eigvalsh(M)[0]
+            if not np.isfinite(minimum_eigenvalue) or minimum_eigenvalue <= 0:
+                raise ValueError(
+                    "log_minimum_eigenvalue requires a positive-definite "
+                    "information matrix."
+                )
+            obj_value = np.log(minimum_eigenvalue) - np.log(self.eigenvalue_reference)
         elif self.objective_option == ObjectiveLib.condition_number:
             eig = np.linalg.eigvalsh(M)
             obj_value = np.log(np.abs(np.max(eig) / np.min(eig)))
@@ -260,11 +369,9 @@ class FIMExternalGreyBox(
         # Set initial values of the inputs/outputs
         # This will depend on the objective used
 
-        # Initialize grey box FIM values
+        # Initialize GreyBox inputs in the same order used by set_input_values.
         for ind, val in enumerate(self.input_names()):
-            pyomo_block.inputs[val] = self.doe_object.fim_initial[
-                self._masking_matrix > 0
-            ][ind]
+            pyomo_block.inputs[val] = self._input_values[ind]
 
         # Initialize log_determinant value
         from pyomo.contrib.doe import ObjectiveLib
@@ -282,6 +389,8 @@ class FIMExternalGreyBox(
             pyomo_block.outputs["log-D-opt"] = output_value
         elif self.objective_option == ObjectiveLib.minimum_eigenvalue:
             pyomo_block.outputs["E-opt"] = output_value
+        elif self.objective_option == ObjectiveLib.log_minimum_eigenvalue:
+            pyomo_block.outputs["log-E-opt"] = output_value
         elif self.objective_option == ObjectiveLib.condition_number:
             pyomo_block.outputs["ME-opt"] = output_value
 
@@ -291,25 +400,24 @@ class FIMExternalGreyBox(
         # Returns coo_matrix of the correct shape
         return None
 
-    def evaluate_jacobian_outputs(self):
-        # Compute the jacobian of the objective function with
-        # respect to the fisher information matrix. Then, return
-        # a coo_matrix that aligns with what IPOPT will expect.
-        current_FIM = self._get_FIM()
+    def _check_log_eigenvalue_gap(self, M):
+        from pyomo.contrib.doe import ObjectiveLib
 
-        M = np.asarray(current_FIM, dtype=np.float64).reshape(
-            self._n_params, self._n_params
-        )
+        if self.objective_option == ObjectiveLib.log_minimum_eigenvalue:
+            eigenvalues = np.linalg.eigvalsh(M)
+            if not np.isfinite(eigenvalues).all() or eigenvalues[0] <= 0:
+                raise ValueError(
+                    "log_minimum_eigenvalue requires a positive-definite information matrix."
+                )
+            if len(eigenvalues) > 1 and eigenvalues[1] - eigenvalues[0] <= (
+                10 * np.finfo(float).eps * max(abs(eigenvalues))
+            ):
+                raise ValueError(
+                    "log_minimum_eigenvalue derivatives require a simple minimum eigenvalue."
+                )
 
-        # TODO: Add inertia correction for
-        #       negative/small eigenvalues
-        # M is symmetric by construction (see _get_FIM), so use
-        # eigh to guarantee a real dtype (eig can return complex
-        # eigenvalues/eigenvectors due to floating-point asymmetry noise).
-        eig_vals, eig_vecs = np.linalg.eigh(M)
-        if min(eig_vals) <= 1e-3:
-            pass
-
+    def _objective_gradient_matrix(self, M):
+        self._check_log_eigenvalue_gap(M)
         from pyomo.contrib.doe import ObjectiveLib
 
         if self.objective_option == ObjectiveLib.trace:
@@ -326,7 +434,11 @@ class FIMExternalGreyBox(
             # calculus. Add reference to pyomo.DoE 2.0
             # manuscript S.I.
             jac_M = 0.5 * (Minv + Minv.transpose())
-        elif self.objective_option == ObjectiveLib.minimum_eigenvalue:
+        elif self.objective_option in (
+            ObjectiveLib.minimum_eigenvalue,
+            ObjectiveLib.log_minimum_eigenvalue,
+        ):
+            eig_vals, eig_vecs = np.linalg.eigh(M)
             # Obtain minimum eigenvalue location
             min_eig_loc = np.argmin(eig_vals)
 
@@ -342,7 +454,16 @@ class FIMExternalGreyBox(
             # the eigenvector we grabbed in
             # the previous line of code.
             jac_M = min_eig_vec * np.transpose(min_eig_vec)
+            if self.objective_option == ObjectiveLib.log_minimum_eigenvalue:
+                minimum_eigenvalue = eig_vals[min_eig_loc]
+                if not np.isfinite(minimum_eigenvalue) or minimum_eigenvalue <= 0:
+                    raise ValueError(
+                        "log_minimum_eigenvalue requires a positive-definite "
+                        "information matrix."
+                    )
+                jac_M /= minimum_eigenvalue
         elif self.objective_option == ObjectiveLib.condition_number:
+            eig_vals, eig_vecs = np.linalg.eigh(M)
             # Obtain minimum (and maximum) eigenvalue location(s)
             min_eig_loc = np.argmin(eig_vals)
             max_eig_loc = np.argmax(eig_vals)
@@ -369,21 +490,56 @@ class FIMExternalGreyBox(
             jac_M = 1 / max_eig * max_eig_term - 1 / min_eig * min_eig_term
         else:
             ObjectiveLib(self.objective_option)
+        return jac_M
 
-        # We are only using a symmetric, triangular
-        # representation of the FIM, so we need
-        # to add the off-diagonal elements twice.
-        jac_M = 2 * jac_M - np.diag(np.diag(jac_M))
-        # Filter the Jacobian, jac_M, using the
-        # masking matrix to only select the
-        # symmetric, triangular components
-        jac_M = jac_M[self._masking_matrix > 0]
-        M_rows = np.zeros((len(jac_M.flatten()), 1)).flatten()
-        M_cols = np.arange(len(jac_M.flatten()))
+    def _sensitivity_to_fim_jacobian(self):
+        sensitivity = self._input_values.reshape(
+            len(self._measurement_names), self._n_params
+        )
+        derivative = np.zeros((len(self._fim_input_names), self._n_inputs))
+        for fim_index, (row_name, col_name) in enumerate(self._fim_input_names):
+            row = self._param_names.index(row_name)
+            col = self._param_names.index(col_name)
+            for measurement in range(len(self._measurement_names)):
+                weight = self._measurement_weights[measurement]
+                if row == col:
+                    derivative[fim_index, measurement * self._n_params + row] = (
+                        2.0 * weight * sensitivity[measurement, row]
+                    )
+                else:
+                    derivative[fim_index, measurement * self._n_params + row] = (
+                        weight * sensitivity[measurement, col]
+                    )
+                    derivative[fim_index, measurement * self._n_params + col] = (
+                        weight * sensitivity[measurement, row]
+                    )
+        return derivative
 
-        # Returns coo_matrix of the correct shape
+    @staticmethod
+    def _pack_symmetric_gradient(gradient):
+        packed = 2.0 * gradient - np.diag(np.diag(gradient))
+        return packed[np.triu_indices_from(packed)]
+
+    def evaluate_jacobian_outputs(self):
+        """Return the objective gradient with respect to the selected M or J inputs."""
+        # Compute the objective gradient with respect to the selected GreyBox
+        # inputs and return the sparse row expected by PyNumero.
+        M = np.asarray(self._get_FIM(), dtype=np.float64).reshape(
+            self._n_params, self._n_params
+        )
+        gradient_matrix = self._objective_gradient_matrix(M)
+        packed_gradient = self._pack_symmetric_gradient(gradient_matrix)
+
+        if self.fim_formulation == "sensitivity":
+            jacobian = packed_gradient @ self._sensitivity_to_fim_jacobian()
+        else:
+            jacobian = packed_gradient
+
+        rows = np.zeros(len(jacobian), dtype=int)
+        cols = np.arange(len(jacobian))
+
         return scipy.sparse.coo_matrix(
-            (jac_M.flatten(), (M_rows, M_cols)), shape=(1, len(jac_M.flatten()))
+            (jacobian, (rows, cols)), shape=(1, self._n_inputs)
         )
 
     # Beyond here is for Hessian information
@@ -414,7 +570,7 @@ class FIMExternalGreyBox(
         return None
 
     def evaluate_hessian_outputs(self):
-        """Return the multiplier-weighted Hessian of the FIM metric.
+        """Return the multiplier-weighted Hessian for the selected M or J inputs.
 
         Returns
         -------
@@ -429,6 +585,8 @@ class FIMExternalGreyBox(
         M = np.asarray(current_FIM, dtype=np.float64).reshape(
             self._n_params, self._n_params
         )
+
+        self._check_log_eigenvalue_gap(M)
 
         # We will store the Hessian values in
         # vectorized (flattened) format. The length
@@ -513,12 +671,12 @@ class FIMExternalGreyBox(
                 # Note: we are only interested in building
                 # the lower triangular portion of the Hessian.
                 row = max(
-                    self.input_names().index(d1_symmetric),
-                    self.input_names().index(d2_symmetric),
+                    self._fim_input_names.index(d1_symmetric),
+                    self._fim_input_names.index(d2_symmetric),
                 )
                 col = min(
-                    self.input_names().index(d1_symmetric),
-                    self.input_names().index(d2_symmetric),
+                    self._fim_input_names.index(d1_symmetric),
+                    self._fim_input_names.index(d2_symmetric),
                 )
                 flattened_row_col_index = (row + 1) * row // 2 + col
 
@@ -585,12 +743,12 @@ class FIMExternalGreyBox(
                 # Identify what index of the symmetric FIM
                 # Hessian arrays need to be updated
                 row = max(
-                    self.input_names().index(d1_symmetric),
-                    self.input_names().index(d2_symmetric),
+                    self._fim_input_names.index(d1_symmetric),
+                    self._fim_input_names.index(d2_symmetric),
                 )
                 col = min(
-                    self.input_names().index(d1_symmetric),
-                    self.input_names().index(d2_symmetric),
+                    self._fim_input_names.index(d1_symmetric),
+                    self._fim_input_names.index(d2_symmetric),
                 )
                 flattened_row_col_index = (row + 1) * row // 2 + col
 
@@ -608,7 +766,10 @@ class FIMExternalGreyBox(
                 hess_rows[flattened_row_col_index] = row
                 hess_cols[flattened_row_col_index] = col
 
-        elif self.objective_option == ObjectiveLib.minimum_eigenvalue:
+        elif self.objective_option in (
+            ObjectiveLib.minimum_eigenvalue,
+            ObjectiveLib.log_minimum_eigenvalue,
+        ):
             # Grab eigenvalues and eigenvectors
             # Also need the min location
             all_eig_vals, all_eig_vecs = np.linalg.eigh(M)
@@ -618,6 +779,14 @@ class FIMExternalGreyBox(
             # eigenvector
             min_eig = all_eig_vals[min_eig_loc]
             min_eig_vec = np.array([all_eig_vecs[:, min_eig_loc]])
+            if (
+                self.objective_option == ObjectiveLib.log_minimum_eigenvalue
+                and min_eig <= 0
+            ):
+                raise ValueError(
+                    "log_minimum_eigenvalue requires a positive-definite "
+                    "information matrix."
+                )
 
             for current_differential in input_differentials_2D:
                 # Row, Col and i, j, k, l values are
@@ -662,6 +831,13 @@ class FIMExternalGreyBox(
                         / (min_eig - all_eig_vals[curr_eig])
                     )
 
+                if self.objective_option == ObjectiveLib.log_minimum_eigenvalue:
+                    first_d1 = min_eig_vec[0, i] * min_eig_vec[0, j]
+                    first_d2 = min_eig_vec[0, k] * min_eig_vec[0, l]
+                    hess_contribution = (
+                        hess_contribution / min_eig - first_d1 * first_d2 / min_eig**2
+                    )
+
                 # Since we are considering the full matrix in
                 # this loop, we need to point the contribution
                 # to the correct index for the symmetric FIM
@@ -679,12 +855,12 @@ class FIMExternalGreyBox(
                 # Identify what index of the symmetric FIM
                 # Hessian arrays need to be updated
                 row = max(
-                    self.input_names().index(d1_symmetric),
-                    self.input_names().index(d2_symmetric),
+                    self._fim_input_names.index(d1_symmetric),
+                    self._fim_input_names.index(d2_symmetric),
                 )
                 col = min(
-                    self.input_names().index(d1_symmetric),
-                    self.input_names().index(d2_symmetric),
+                    self._fim_input_names.index(d1_symmetric),
+                    self._fim_input_names.index(d2_symmetric),
                 )
                 flattened_row_col_index = (row + 1) * row // 2 + col
 
@@ -854,12 +1030,12 @@ class FIMExternalGreyBox(
                 # Identify what index of the symmetric FIM
                 # Hessian arrays need to be updated
                 row = max(
-                    self.input_names().index(d1_symmetric),
-                    self.input_names().index(d2_symmetric),
+                    self._fim_input_names.index(d1_symmetric),
+                    self._fim_input_names.index(d2_symmetric),
                 )
                 col = min(
-                    self.input_names().index(d1_symmetric),
-                    self.input_names().index(d2_symmetric),
+                    self._fim_input_names.index(d1_symmetric),
+                    self._fim_input_names.index(d2_symmetric),
                 )
                 flattened_row_col_index = (row + 1) * row // 2 + col
 
@@ -878,11 +1054,28 @@ class FIMExternalGreyBox(
         else:
             ObjectiveLib(self.objective_option)
 
-        # The ExternalGreyBoxModel contract requires the Hessian of the
-        # output constraint contribution to the Lagrangian, not the raw
-        # Hessian of the output itself.
+        n_fim_inputs = len(self._fim_input_names)
         output_hessian = scipy.sparse.coo_matrix(
             (np.asarray(hess_vals), (hess_rows, hess_cols)),
-            shape=(self._n_inputs, self._n_inputs),
+            shape=(n_fim_inputs, n_fim_inputs),
         )
+        if self.fim_formulation == "sensitivity":
+            packed = output_hessian.toarray()
+            packed = packed + packed.T - np.diag(np.diag(packed))
+            derivative = self._sensitivity_to_fim_jacobian()
+            transformed = derivative.T @ packed @ derivative
+            # Exact second chain-rule term: d2(J.T W J) contributes a
+            # block 2*w*grad_M(objective) for each measurement row of J.
+            gradient = self._objective_gradient_matrix(M)
+            for measurement, weight in enumerate(self._measurement_weights):
+                start = measurement * self._n_params
+                transformed[
+                    start : start + self._n_params, start : start + self._n_params
+                ] += (2.0 * weight * gradient)
+            rows, cols = np.tril_indices(self._n_inputs)
+            # Keep a fixed sparsity pattern, including numerical zeros.
+            output_hessian = scipy.sparse.coo_matrix(
+                (transformed[rows, cols], (rows, cols)),
+                shape=(self._n_inputs, self._n_inputs),
+            )
         return self._output_con_mult_values[0] * output_hessian
