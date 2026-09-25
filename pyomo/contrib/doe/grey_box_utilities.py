@@ -136,11 +136,10 @@ class FIMExternalGreyBox(
         )
         self._n_inputs = len(self._input_values)
 
-        # Multiplier of the (single) output constraint, set by the solver
-        # through set_output_constraint_multipliers(). Defaults to 1 so that
-        # calling evaluate_hessian_outputs() directly returns the bare
-        # Hessian of the output.
-        self._output_con_mult_values = np.ones(1, dtype=np.float64)
+        # The solver updates this value before requesting the Hessian of the
+        # Lagrangian.  A unit default preserves the unweighted output Hessian
+        # for direct users of the external model.
+        self._output_con_mult_values = np.ones(self.n_outputs(), dtype=np.float64)
 
     def _get_FIM(self):
         # Grabs the current FIM subject
@@ -396,11 +395,11 @@ class FIMExternalGreyBox(
         )
 
     def set_output_constraint_multipliers(self, output_con_multiplier_values):
-        # TODO: Do any objectives require constraints?
-        # Assert length matches
-        self._output_con_mult_values = np.asarray(
+        output_con_multiplier_values = np.asarray(
             output_con_multiplier_values, dtype=np.float64
         )
+        assert self.n_outputs() == len(output_con_multiplier_values)
+        self._output_con_mult_values = output_con_multiplier_values
 
     def evaluate_hessian_equality_constraints(self):
         # Returns coo_matrix of the correct shape
@@ -865,18 +864,11 @@ class FIMExternalGreyBox(
         else:
             ObjectiveLib(self.objective_option)
 
-        # ExternalGreyBoxModel's contract is that this returns the Hessian of
-        # the outputs weighted by the output constraint multipliers,
-        # sum_i y_i * hess(w_i). There is a single output here, so scale by
-        # y. Without this, the Lagrangian Hessian passed to the solver is
-        # correct only when y == 1 (wrong sign for maximized objectives,
-        # where y -> -1 at a solution).
-        hess_vals = np.asarray(hess_vals, dtype=np.float64) * (
-            self._output_con_mult_values[0]
-        )
-
-        # Returns coo_matrix of the correct shape
-        return scipy.sparse.coo_matrix(
-            (hess_vals, (hess_rows, hess_cols)),
+        # The ExternalGreyBoxModel contract requires the Hessian of the
+        # output constraint contribution to the Lagrangian, not the raw
+        # Hessian of the output itself.
+        output_hessian = scipy.sparse.coo_matrix(
+            (np.asarray(hess_vals), (hess_rows, hess_cols)),
             shape=(self._n_inputs, self._n_inputs),
         )
+        return self._output_con_mult_values[0] * output_hessian
