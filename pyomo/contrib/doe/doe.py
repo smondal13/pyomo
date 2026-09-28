@@ -4256,6 +4256,18 @@ class DesignOfExperiments:
         # (mirroring how ``fim_initial`` was just read from ``fim_expr``).
         sensitivity_kwargs = {}
         if self.grey_box_fim_formulation == GreyBoxFIMFormulation.sensitivity:
+            if fim_expr is not getattr(model, "fim", None) or not (
+                hasattr(model, "sensitivity_jacobian")
+                and hasattr(model, "fim_constraint")
+            ):
+                raise NotImplementedError(
+                    "grey_box_fim_formulation='sensitivity' is only implemented "
+                    "for the single-experiment run_doe() path, where "
+                    "``sensitivity_jacobian`` and ``fim_constraint`` live on the "
+                    "same block as ``fim``. The multi-experiment "
+                    "optimize_experiments() path aggregates several FIMs and "
+                    "must use grey_box_fim_formulation='fim'."
+                )
             measurement_names = list(model.output_names)
             sensitivity_kwargs = dict(
                 measurement_names=measurement_names,
@@ -4309,18 +4321,6 @@ class DesignOfExperiments:
                 return pyo.Constraint.Skip
 
         if self.grey_box_fim_formulation == GreyBoxFIMFormulation.sensitivity:
-            if fim_expr is not getattr(model, "fim", None) or not (
-                hasattr(model, "sensitivity_jacobian")
-                and hasattr(model, "fim_constraint")
-            ):
-                raise NotImplementedError(
-                    "grey_box_fim_formulation='sensitivity' is only implemented "
-                    "for the single-experiment run_doe() path, where "
-                    "``sensitivity_jacobian`` and ``fim_constraint`` live on the "
-                    "same block as ``fim``. The multi-experiment "
-                    "optimize_experiments() path aggregates several FIMs and "
-                    "must use grey_box_fim_formulation='fim'."
-                )
             # FIM entries are reconstructed from J inside the external model.
             # Exclude the lifted FIM equations from the solver problem.
             model.fim_constraint.deactivate()
