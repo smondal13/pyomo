@@ -212,14 +212,21 @@ class FIMExternalGreyBox(
             )
         if self.fim_formulation == "sensitivity":
             prior = self._prior_FIM
+            # Symmetry is judged relative to the matrix scale: a prior
+            # assembled as J.T @ W @ J in floating point is symmetric only to
+            # round-off, and its entries can be O(1e6) or larger.
+            symmetry_tol = 1e-12 * max(1.0, np.abs(prior).max())
             if (
                 prior.shape != (self._n_params, self._n_params)
                 or not np.isfinite(prior).all()
-                or not np.allclose(prior, prior.T, rtol=0, atol=1e-12)
+                or not np.allclose(prior, prior.T, rtol=0, atol=symmetry_tol)
             ):
                 raise ValueError(
                     "The sensitivity formulation requires a finite symmetric prior FIM."
                 )
+            # Use the exactly symmetric part so the reconstructed FIM is
+            # exactly symmetric too (eigh assumes it).
+            self._prior_FIM = prior = 0.5 * (prior + prior.T)
             if np.linalg.eigvalsh(prior)[0] < -1e-12 * max(
                 1.0, np.linalg.norm(prior, 2)
             ):
